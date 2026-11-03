@@ -1,0 +1,12 @@
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { stopProcess } from './stop-process.mjs';
+const root = fileURLToPath(new URL('../', import.meta.url));
+const [command = 'dev', ...args] = process.argv.slice(2);
+if (!['dev', 'build', 'start'].includes(command)) throw new Error('Use dev, build or start.');
+const portIndex = args.indexOf('--port'); const port = portIndex < 0 ? process.env.PORT : args[portIndex + 1];
+const options = command === 'build' ? [path.join(root, 'scripts/build-backend.mjs')] : command === 'start' ? [path.join(root, 'backend/dist/index.mjs')] : ['--import', 'tsx', '--watch', path.join(root, 'backend/src/index.ts')];
+const child = spawn(process.execPath, options, { cwd: path.join(root, 'backend'), stdio: 'inherit', windowsHide: true, env: { ...process.env, CARE_RECORD_ROOT: root, NODE_ENV: command === 'start' ? 'production' : 'development', ...(port ? { PORT: port } : {}) } });
+process.on('SIGINT', () => stopProcess(child)); process.on('SIGTERM', () => stopProcess(child)); process.on('exit', () => stopProcess(child));
+child.on('exit', code => process.exit(code ?? 0));

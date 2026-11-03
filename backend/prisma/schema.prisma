@@ -1,0 +1,226 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model StaffAccount {
+  id String @id
+  recordOrder Int @default(autoincrement()) @map("_record_order")
+  username String @unique
+  name String
+  role String
+  passwordHash String @map("password_hash")
+  salt String
+  active Boolean @default(true)
+  failedAttempts Int @default(0) @map("failed_attempts")
+  lockedUntil String? @map("locked_until")
+  mustChangePassword Boolean @default(false) @map("must_change_password")
+  sessions StaffSession[]
+  patients Patient[]
+  visits Visit[]
+  notifications StaffNotification[]
+  @@map("staff_accounts")
+}
+
+model StaffSession {
+  tokenHash String @id @map("token_hash")
+  userId String @map("user_id")
+  createdAt String @map("created_at")
+  lastSeen String @map("last_seen")
+  expiresAt String @map("expires_at")
+  user StaffAccount @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@map("staff_sessions")
+}
+
+model Patient {
+  id String @id
+  name String
+  dob String
+  phone String @default("")
+  doctorId String? @map("doctor_id")
+  source String @default("Clinic registration")
+  version Int @default(1)
+  updatedAt String @map("updated_at")
+  doctor StaffAccount? @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  visits Visit[]
+  labs LabReport[]
+  invoices Invoice[]
+  reviews QualityReview[]
+  imports SourceImport[]
+  @@map("clinic_patients")
+}
+
+model Visit {
+  id String @id
+  patientId String @map("patient_id")
+  doctorId String @map("doctor_id")
+  date String
+  reason String
+  notes String @default("")
+  status String @default("draft")
+  signedAt String? @map("signed_at")
+  history Json @default("[]")
+  version Int @default(1)
+  updatedAt String @map("updated_at")
+  clinical Json @default("{}")
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  doctor StaffAccount @relation(fields: [doctorId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  labs LabReport[]
+  invoice Invoice?
+  workflow VisitWorkflow?
+  @@map("clinic_visits")
+}
+
+model LabReport {
+  id String @id
+  patientId String @map("patient_id")
+  visitId String @map("visit_id")
+  testName String @map("test_name")
+  value String @default("")
+  unit String @default("")
+  collectedAt String @default("") @map("collected_at")
+  status String @default("requested")
+  requestedBy String @map("requested_by")
+  approvedBy String? @map("approved_by")
+  approvedAt String? @map("approved_at")
+  history Json @default("[]")
+  sourceRef String @map("source_ref")
+  version Int @default(1)
+  updatedAt String @map("updated_at")
+  layout String @default("general")
+  measurements Json @default("[]")
+  specimen String @default("")
+  reportComment String @default("") @map("report_comment")
+  urgency String @default("routine")
+  contact Json @default("{}")
+  doctorReview Json @default("{}") @map("doctor_review")
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  visit Visit @relation(fields: [visitId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@map("laboratory_reports")
+}
+
+model Invoice {
+  id String @id
+  patientId String @map("patient_id")
+  visitId String @unique @map("visit_id")
+  date String
+  items Json
+  total BigInt
+  paid BigInt @default(0)
+  payments Json @default("[]")
+  sourceRef String @map("source_ref")
+  version Int @default(1)
+  updatedAt String @map("updated_at")
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  visit Visit @relation(fields: [visitId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@map("billing_invoices")
+}
+
+model QualityReview {
+  id String @id
+  kind String
+  patientId String? @map("patient_id")
+  recordId String @map("record_id")
+  title String
+  detail String
+  ownerRole String @map("owner_role")
+  state String @default("open")
+  resolution String?
+  evidence String?
+  resolvedBy String? @map("resolved_by")
+  resolvedAt String? @map("resolved_at")
+  createdAt String @map("created_at")
+  patient Patient? @relation(fields: [patientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@map("quality_reviews")
+}
+
+model SourceImport {
+  id String @id
+  source String
+  externalId String @map("external_id")
+  payload Json
+  state String @default("held")
+  linkedPatientId String? @map("linked_patient_id")
+  receivedAt String @map("received_at")
+  linkedPatient Patient? @relation(fields: [linkedPatientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@unique([source, externalId], map: "source_external_unique")
+  @@map("source_imports")
+}
+
+model WarehouseFact {
+  id String @id
+  source String
+  sourceId String @map("source_id")
+  kind String
+  patientKey String @map("patient_key")
+  visitId String @map("visit_id")
+  date String
+  service String
+  total BigInt @default(0)
+  paid BigInt @default(0)
+  refreshedAt String @map("refreshed_at")
+  @@map("warehouse_facts")
+}
+
+model WarehouseRun {
+  id String @id
+  at String
+  userId String @map("user_id")
+  count Int
+  summary Json
+  @@map("warehouse_runs")
+}
+
+model ActivityHistory {
+  id String @id
+  at String
+  userId String @map("user_id")
+  actor String
+  role String
+  action String
+  entityType String @map("entity_type")
+  entityId String @map("entity_id")
+  patientId String? @map("patient_id")
+  detail String
+  @@map("activity_history")
+}
+
+model AppSetting {
+  key String @id
+  value String
+  @@map("app_settings")
+}
+
+model VisitWorkflow {
+  visitId String @id @map("visit_id")
+  checkedInAt String? @map("checked_in_at")
+  billingReadyAt String? @map("billing_ready_at")
+  queueKey String? @unique(map: "one_active_checkin") @map("queue_key")
+  visit Visit @relation(fields: [visitId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@map("visit_workflow")
+}
+
+model StaffNotification {
+  id String @id
+  recipientId String @map("recipient_id")
+  recipientRole String @map("recipient_role")
+  actor String
+  kind String
+  body String
+  subject String
+  patientId String? @map("patient_id")
+  entityId String @map("entity_id")
+  href String
+  createdAt String @map("created_at")
+  readAt String? @map("read_at")
+  archivedAt String? @map("archived_at")
+  eventKey String @map("event_key")
+  recipient StaffAccount @relation(fields: [recipientId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@unique([recipientId, eventKey], map: "notification_delivery_unique")
+  @@map("staff_notifications")
+}

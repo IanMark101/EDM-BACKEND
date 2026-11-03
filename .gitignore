@@ -1,0 +1,48 @@
+# Dependencies
+/node_modules/
+
+# Generated builds and framework state
+/dist/
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Test output
+/coverage/
+
+# Package-manager logs
+npm-debug.log*
+
+# Local environment and keys
+.env*
+.dev.vars*
+*.pem
+
+# Checkout-local tool state
+/.wrangler/
+/.taste-skill/
+
+# Workspace scaffolding and publication archives
+/.agents/
+/.codex/
+/outputs/
+/work/
+/tmp/
+
+# OS metadata
+.DS_Store
+
+# Separated package build/runtime state
+/frontend/node_modules/
+/backend/node_modules/
+/frontend/dist/
+/backend/dist/
+/frontend/.next/
+/frontend/.wrangler/
+/backend/.wrangler/
+/frontend/next-env.d.ts
+
+# Prisma generated client and private connection settings
+/backend/src/generated/
+!backend/.env.example

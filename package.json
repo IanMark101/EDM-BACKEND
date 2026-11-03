@@ -1,0 +1,23 @@
+{
+  "name": "care-record",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "workspaces": [
+    "backend"
+  ],
+  "scripts": {
+    "dev": "node scripts/run-backend.mjs dev",
+    "build": "node scripts/run-backend.mjs build",
+    "start": "node scripts/run-backend.mjs start",
+    "typecheck": "npm run typecheck --workspace @care-record/backend",
+    "db:generate": "npm run db:generate --workspace @care-record/backend",
+    "db:migrate": "npm run db:migrate --workspace @care-record/backend",
+    "db:check": "npm run db:check --workspace @care-record/backend",
+    "clinic:initialize": "node scripts/initialize-clinic.mjs",
+    "postinstall": "npm run db:generate"
+  }
+}
