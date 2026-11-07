@@ -19,6 +19,7 @@ const bundle = await build({
     export { repository } from './backend/src/repositories/clinic.repository.ts';
     export { onNotificationChanges } from './backend/src/lib/notification-events.ts';
     export { routeRequest } from './backend/src/routes/clinic.routes.ts';
+    export { prepareHostedClinic } from './backend/src/services/clinic-setup.ts';
   `, resolveDir: root },
   write: false, bundle: true, platform: 'node', format: 'esm', tsconfigRaw: {},
   plugins: [{ name: 'isolated-database', setup(build) {
@@ -26,7 +27,7 @@ const bundle = await build({
     build.onResolve({ filter: /config\/environment$/ }, () => ({ path: 'environment', namespace: 'fixture' }));
     build.onResolve({ filter: /repositories\/seed$/ }, () => ({ path: 'seed', namespace: 'fixture' }));
     build.onLoad({ filter: /.*/, namespace: 'fixture' }, args => ({ loader: 'js', contents:
-      args.path === 'prisma' ? 'export const getPrisma=()=>globalThis.__workflowDatabase.client;' :
+      args.path === 'prisma' ? 'export const getPrisma=()=>globalThis.__workflowDatabase.client; export function createDatabaseClient(){throw new Error("External database access is disabled in tests");}' :
       args.path === 'environment' ? 'export const environment={origins:[],databaseUrl:"",seedTestData:false};' :
       'export const ensureSeed=async()=>{};' }));
     build.onResolve({ filter: /^\./ }, args => {
@@ -38,7 +39,7 @@ const bundle = await build({
     build.onLoad({ filter: /.*/, namespace: 'source' }, args => ({ contents: readFileSync(args.path, 'utf8'), loader: extname(args.path) === '.ts' ? 'ts' : 'js' }));
   } }],
 });
-const { importsService, reviewsService, invoicesService, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
+const { importsService, reviewsService, invoicesService, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
 const modelNames = ['staffAccount', 'staffSession', 'patient', 'visit', 'labReport', 'invoice', 'qualityReview', 'sourceImport', 'warehouseFact', 'warehouseRun', 'activityHistory', 'appSetting', 'visitWorkflow', 'staffNotification', 'patientPortalAccount', 'patientPortalSession'];
 function matches(row, where = {}) {
@@ -510,6 +511,41 @@ async function staffCookie(user) {
   db.tables.staffSession.push({ tokenHash, userId: user.id, lastSeen: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString() });
   return `carerecord_session=${token}`;
 }
+
+test('hosted startup creates one manager, and redeploys keep the account and password', async () => {
+  for (const name of modelNames) db.tables[name] = [];
+  const password = 'FictionalHostedPass123!';
+  assert.equal(await prepareHostedClinic({ seedTestData: false, managerPassword: password }), true);
+  assert.equal(db.tables.staffAccount.length, 1);
+  assert.equal(db.tables.staffAccount[0].username, 'clinic-manager');
+  assert.equal(db.tables.staffAccount[0].role, 'manager');
+  assert.ok(!JSON.stringify(db.tables).includes(password));
+
+  const setup = structuredClone(db.tables);
+  assert.equal(await prepareHostedClinic({ seedTestData: false, managerPassword: 'DifferentDemoPass123!' }), false);
+  assert.equal(await prepareHostedClinic({ seedTestData: false }), false);
+  assert.deepEqual(db.tables, setup);
+  assert.equal((await api('login', { username: 'clinic-manager', password })).status, 200);
+});
+
+test('hosted startup rejects practice databases and requires a private first-use password', async () => {
+  db.tables.appSetting.push({ key: 'seed-v1', value: 'demo' });
+  const practice = structuredClone(db.tables);
+  await assert.rejects(prepareHostedClinic({ seedTestData: false, managerPassword: 'FictionalHostedPass123!' }), /separate empty database/);
+  assert.deepEqual(db.tables, practice);
+
+  for (const name of modelNames) db.tables[name] = [];
+  await assert.rejects(prepareHostedClinic({ seedTestData: false }), /CLINIC_MANAGER_PASSWORD/);
+  await assert.rejects(prepareHostedClinic({ seedTestData: false, managerPassword: 'CareRecord2026!' }), /individual password/);
+  assert.equal(db.tables.staffAccount.length, 0);
+  assert.equal(db.tables.appSetting.length, 0);
+});
+
+test('first-use setup cannot overwrite an unmarked but populated database', async () => {
+  const original = structuredClone(db.tables);
+  await assert.rejects(prepareHostedClinic({ seedTestData: false, managerPassword: 'FictionalHostedPass123!' }), /not empty/);
+  assert.deepEqual(db.tables, original);
+});
 
 test('portal activation is single use and staff can replace access without exposing credentials', async () => {
   const staff = await staffCookie({ id: 'U-FRONT', name: 'Front desk', role: 'registration', active: true });

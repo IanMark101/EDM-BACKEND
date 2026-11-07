@@ -1,6 +1,5 @@
 import { getPrisma, createDatabaseClient } from '../config/prisma';
 import { delegate, normalizeRecord, type TableName } from './clinic.repository';
-import { Prisma } from '../generated/prisma/client';
 const originalTables: TableName[] = ['staffAccounts', 'appSettings', 'patients', 'visits', 'labReports', 'invoices', 'qualityReviews', 'sourceImports', 'warehouseFacts', 'warehouseRuns', 'activityHistory', 'visitWorkflow', 'staffNotifications', 'staffSessions'];
 const portalTables: TableName[] = ['patientPortalAccounts', 'patientPortalSessions'];
 export const snapshotOrder = [...originalTables, ...portalTables];
@@ -45,7 +44,7 @@ export async function importIntoEmptyDatabase(snapshot: ClinicSnapshot, client =
       if (counts[name] !== rows.length) throw new Error('The import count did not match the source.');
     }
     return counts;
-  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeout: 120_000 });
+  }, { isolationLevel: 'Serializable', timeout: 120_000 });
 }
 export async function restoreToSeparateTarget(snapshot: ClinicSnapshot, url: string) {
   const client = createDatabaseClient(url);

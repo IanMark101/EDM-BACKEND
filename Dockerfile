@@ -17,4 +17,4 @@ RUN npm run build
 
 ENV NODE_ENV=production HOST=0.0.0.0 CLINIC_AUTOBACKUP=0
 USER node
-CMD ["node", "backend/dist/index.mjs"]
+CMD ["sh", "-ec", ": \"${DATABASE_URL:?Set DATABASE_URL in Railway Variables.}\"; npm run db:migrate; exec node backend/dist/index.mjs"]

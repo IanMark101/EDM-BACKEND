@@ -22,29 +22,18 @@ The `shared/` folder contains the types and rules used by both applications. Kee
 
 ## Railway deployment
 
-Prepare a separate empty Neon database for the hosted app. The local practice database has shared demo credentials. The public API requires a clinic initialized with an individual manager account.
+1. Import `EDM-BACKEND` from GitHub into Railway with the repository root `/`. Use the default Dockerfile start command.
+2. Add the variables below and deploy. The container applies database migrations at startup and creates `clinic-manager` on the first start with an empty database. Keep the local shared-password practice database separate from the public app.
+3. Generate the service's public domain. Set that HTTPS origin as `CLINIC_API_ORIGIN` in Vercel. Check `/api/health` on Railway, then sign in on Vercel with the hosted manager account.
 
-1. In a separate local checkout, configure the new database in `backend/.env`. Set `DATABASE_URL` to the pooled URL and `DIRECT_URL` to the direct URL for the same database. From the repository root, run `npm ci` and `npm run db:migrate`.
-2. Run `npm run clinic:initialize` with a private JSON object on standard input. Supply `name`, `username`, `clinicName`, and a unique `password` of at least 12 characters. For example, from PowerShell:
+| Railway variable | Value |
+| --- | --- |
+| `DATABASE_URL` | Pooled Neon URL for the hosted database. |
+| `DIRECT_URL` | Direct Neon URL for the same database. |
+| `CLINIC_MANAGER_PASSWORD` | A new password of at least 12 characters. Required for the first startup with an empty database. You can remove it after the account is created. |
+| `CLINIC_FRONTEND_ORIGINS` | Exact HTTPS origin of the Vercel frontend, without a trailing slash. |
 
-   ```powershell
-   $managerPassword = Read-Host 'New manager password' -AsSecureString
-   $managerCredentials = [pscredential]::new('clinic-manager', $managerPassword)
-   try {
-     @{
-       name = 'Clinic Manager'
-       username = $managerCredentials.UserName
-       clinicName = 'CareRecord Clinic'
-       password = $managerCredentials.GetNetworkCredential().Password
-     } | ConvertTo-Json -Compress | npm run clinic:initialize
-   } finally {
-     Remove-Variable managerPassword, managerCredentials
-   }
-   ```
-
-3. Connect this GitHub repository to Railway with the repository root `/`. Railway builds the included `Dockerfile`. Use its default start command and the port Railway supplies. Set **Pre-Deploy Command** to `npm run db:migrate` and **Healthcheck Path** to `/api/health`.
-4. In Railway Variables, set `DATABASE_URL`, `DIRECT_URL`, and `CLINIC_FRONTEND_ORIGINS`. Use the exact Vercel origin, such as `https://your-care-record.vercel.app`, for `CLINIC_FRONTEND_ORIGINS`. Generate the Railway public domain and verify that `/api/health` returns `ok: true`. The container uses Neon for persistent storage. Configure backups in Neon or use a separate durable backup setup.
-5. Set the Railway HTTPS origin as `CLINIC_API_ORIGIN` on Vercel. After signing in to the hosted app, use the account manager to create individual staff accounts and enter approved prices.
+On later starts the backend uses the existing manager account. The container uses Neon for persistent storage. Configure backups in Neon or use a separate durable backup setup.
 
 ## Import behavior and checks
 

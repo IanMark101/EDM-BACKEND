@@ -3,28 +3,18 @@ import { Readable } from 'node:stream';
 import { routeRequest } from './routes/clinic.routes';
 import { environment } from './config/environment';
 import { disconnectDatabase } from './config/prisma';
-import { match, repository } from './repositories/clinic.repository';
+import { AppError } from '../../shared/domain';
+import { prepareHostedClinic } from './services/clinic-setup';
 import { startAutomaticBackups } from './services/backup.service';
 import { attachNotificationSockets } from './realtime/notifications';
 
 if (!['127.0.0.1', '::1', 'localhost'].includes(environment.host)) {
-  // The local practice database has shared credentials. Require individual
-  // clinic setup before accepting traffic on a public interface.
-  if (environment.seedTestData) {
-    console.error('Turn off CLINIC_SEED_TEST_DATA before exposing the clinic API.');
-    process.exit(1);
-  }
-  let initialized = false;
   try {
-    const [mode] = await repository.find('appSettings', match('key', 'clinic-mode'));
-    initialized = mode?.value === 'production';
-  } catch {
-    console.error('Hosted startup could not read the clinic settings. Check the database connection and migrations.');
-    await disconnectDatabase();
-    process.exit(1);
-  }
-  if (!initialized) {
-    console.error('Hosted startup requires a clinic initialized with individual staff accounts. Use an empty database and run npm run clinic:initialize.');
+    if (!environment.databaseUrl) throw new AppError('Set DATABASE_URL in the hosting service variables.');
+    const created = await prepareHostedClinic({ seedTestData: environment.seedTestData, managerPassword: process.env.CLINIC_MANAGER_PASSWORD });
+    if (created) console.log('Created the first hosted manager account: clinic-manager.');
+  } catch (error) {
+    console.error(error instanceof AppError ? error.message : 'Hosted clinic setup failed. Check the database connection and migrations, and use an empty database for first-time setup.');
     await disconnectDatabase();
     process.exit(1);
   }
