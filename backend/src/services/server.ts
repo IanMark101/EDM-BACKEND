@@ -6,9 +6,11 @@ import { cookieToken, digest, sessionExpired, roleCanReadPatient } from './secur
 import { ensureSeed } from '../repositories/seed';
 import type { StaffNotification } from './notifications';
 import { ensureNotificationBacklog } from './notification-backlog';
+import { readPriceList } from '../repositories/pricing.repository';
+import { chargeOffers } from '../../../shared/billing';
 export const now = () => new Date().toISOString();
 export const newId = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-export function auditRow(user: Staff, action: string, entityType: string, entityId: string, detail: string, patientId?: string) {
+export function auditRow(user: { id: string; name: string; role: Staff['role'] | 'patient' }, action: string, entityType: string, entityId: string, detail: string, patientId?: string) {
     return { id: newId('AUD'), at: now(), userId: user.id, actor: user.name, role: user.role, action, entityType, entityId, patientId: patientId || null, detail };
 }
 export async function audit(user: Staff, action: string, entityType: string, entityId: string, detail: string, patientId?: string) {
@@ -55,6 +57,7 @@ export async function loadAll() {
 }
 export async function visibleData(user: Staff) {
     const data = await loadAll();
+    const priceList = ['manager', 'billing'].includes(user.role) ? await readPriceList() : undefined;
     const patients = data.patients.filter(p => roleCanReadPatient(user, p, data.labs, data.invoices));
     const ids = new Set(patients.map(p => p.id));
     const labVisitIds = new Set(data.labs.map(l => l.visitId));
@@ -72,15 +75,15 @@ export async function visibleData(user: Staff) {
         const p = i.payload as any;
         return { ...i, payload: user.role === 'laboratory' && i.source === 'laboratory' || user.role === 'billing' && i.source === 'billing' ? p : { patientId: p.patientId, patientName: p.patientName, patientDob: p.patientDob, visitId: p.visitId } };
     }) : [];
-    const history = ['reviewer', 'manager'].includes(user.role) ? await repository.find("activityHistory", undefined, { orderBy: "at", limit: 250 }) : [];
     const facts = user.role === 'reviewer' ? data.facts : [];
     await ensureNotificationBacklog(user, { patients, visits, labs, invoices, reviews });
     const notificationList = await repository.find("staffNotifications", allOf(match("recipientId", user.id), match("recipientRole", user.role)), { orderBy: "createdAt", limit: 250 });
     const notifications = notificationList.filter(n => !n.patientId || ids.has(n.patientId))
         .map(({ recipientId, recipientRole, eventKey, ...n }) => n);
-    const billingServices = user.role === 'billing' ? data.visits.filter(v => v.billingReadyAt).map(v => ({
+    const billingServices = user.role === 'billing' ? data.visits.filter(v => v.status === 'signed' && (v.billingReadyAt || data.invoices.some(invoice => invoice.visitId === v.id))).map(v => ({
         visitId: v.id, patientId: v.patientId, consultation: v.status === 'signed',
         tests: data.labs.filter(l => l.visitId === v.id && l.status === 'approved').map(l => ({ id: l.id, name: l.testName })),
+        charges: chargeOffers(v, data.labs, data.staff, priceList!, data.invoices.find(invoice => invoice.visitId === v.id)),
     })) : [];
     const incompleteReports = data.labs.filter(l => l.status !== 'requested' && l.status !== 'approved' && labProblems(l, data.visits.find(v => v.id === l.visitId)).length);
     const quality = user.role === 'reviewer' ? {
@@ -93,10 +96,10 @@ export async function visibleData(user: Staff) {
     return {
         user, patients: patients.map(p => ['laboratory', 'billing'].includes(user.role) ? { id: p.id, name: p.name, dob: p.dob, version: p.version, doctorId: p.doctorId, updatedAt: p.updatedAt, source: p.source } : p),
         visits, labs, invoices, reviews, imports, facts, runs: user.role === 'reviewer' ? data.runs : [],
-        notifications, billingServices, quality,
+        notifications, billingServices, quality, priceList,
         staff: user.role === 'manager' ? data.staff : data.staff.filter(u => u.role === 'doctor' && u.active).map(u => ({ id: u.id, name: u.name, role: u.role })),
-        history: user.role === 'manager' ? history.filter(h => h.entityType === 'staff' || h.entityType === 'session')
-            : history.map(h => ['visit', 'lab'].includes(h.entityType) ? { ...h, detail: 'Action recorded by the responsible department. Clinical content and correction details remain in the authorized clinical record.' } : h),
+        // History is fetched separately with permission-scoped pagination.
+        history: [],
         generatedAt: now(),
     };
 }
@@ -108,24 +111,35 @@ export async function permittedPatient(user: Staff, id: string) {
     return { patient, data };
 }
 export async function refreshWarehouse(user: Staff) {
-    const data = await loadAll();
-    const at = now();
-    const runId = newId('RUN');
-    const validPatients = new Set(data.patients.map(p => p.id));
-    const validVisits = new Map(data.visits.map(v => [v.id, v]));
-    const facts = [
-        ...data.visits.filter(v => v.status === 'signed' && validPatients.has(v.patientId)).map(v => ({ id: `visit:${v.id}`, source: 'Clinic', sourceId: v.id, kind: 'visit', patientKey: v.patientId, visitId: v.id, date: v.date, service: 'Consultation', total: 0, paid: 0, refreshedAt: at })),
-        ...data.labs.filter(l => l.status === 'approved' && !labProblems(l, validVisits.get(l.visitId)).length && validPatients.has(l.patientId)).map(l => ({ id: `lab:${l.id}`, source: 'Laboratory', sourceId: l.sourceRef, kind: 'lab', patientKey: l.patientId, visitId: l.visitId, date: clinicDay(new Date(l.approvedAt || l.collectedAt)), service: l.testName, total: 0, paid: 0, refreshedAt: at })),
-        ...data.invoices.filter(b => validPatients.has(b.patientId) && validVisits.get(b.visitId)?.patientId === b.patientId).map(b => ({ id: `invoice:${b.id}`, source: 'Billing', sourceId: b.sourceRef, kind: 'invoice', patientKey: b.patientId, visitId: b.visitId, date: b.date, service: 'Clinic services', total: b.total, paid: b.paid, refreshedAt: at })),
-        ...data.invoices.filter(b => validPatients.has(b.patientId) && validVisits.get(b.visitId)?.patientId === b.patientId)
-            .flatMap(b => (b.payments as any[]).filter(p => p.id && Number.isInteger(p.amount) && p.amount > 0 && Number.isFinite(Date.parse(p.at)))
-            .map(p => ({ id: `payment:${b.id}:${p.id}`, source: 'Billing', sourceId: p.id, kind: 'payment', patientKey: b.patientId,
-            visitId: b.visitId, date: clinicDay(new Date(p.at)), service: 'Payment received', total: 0, paid: p.amount, refreshedAt: at }))),
-    ];
-    const statements: any[] = [repository.remove("warehouseFacts")];
-    for (let i = 0; i < facts.length; i += 5)
-        statements.push(repository.insert("warehouseFacts", facts.slice(i, i + 5)));
-    statements.push(repository.insert("warehouseRuns", { id: runId, at, userId: user.id, count: facts.length, summary: { ...summarizeFacts(facts), formatVersion: 2 } }), repository.insert("activityHistory", auditRow(user, 'Refreshed reporting copies', 'warehouse', runId, `${facts.length} checked facts copied. Draft results and held imports excluded.`)));
-    await repository.batch(statements as any);
-    return { count: facts.length, refreshedAt: at };
+    try {
+        return await repository.transaction(async store => {
+            const [patients, visits, labs, invoices] = await Promise.all([
+                store.find('patients'), store.find('visits'), store.find('labReports'), store.find('invoices'),
+            ]);
+            const data = { patients, visits, labs, invoices };
+            const at = now();
+            const runId = newId('RUN');
+            const validPatients = new Set(data.patients.map(p => p.id));
+            const validVisits = new Map(data.visits.map(v => [v.id, v]));
+            const facts = [
+                ...data.visits.filter(v => v.status === 'signed' && validPatients.has(v.patientId)).map(v => ({ id: `visit:${v.id}`, source: 'Clinic', sourceId: v.id, kind: 'visit', patientKey: v.patientId, visitId: v.id, date: v.date, service: 'Consultation', total: 0, paid: 0, refreshedAt: at })),
+                ...data.labs.filter(l => l.status === 'approved' && !labProblems(l, validVisits.get(l.visitId)).length && validPatients.has(l.patientId)).map(l => ({ id: `lab:${l.id}`, source: 'Laboratory', sourceId: l.sourceRef, kind: 'lab', patientKey: l.patientId, visitId: l.visitId, date: clinicDay(new Date(l.approvedAt || l.collectedAt)), service: l.testName, total: 0, paid: 0, refreshedAt: at })),
+                ...data.invoices.filter(b => validPatients.has(b.patientId) && validVisits.get(b.visitId)?.patientId === b.patientId).map(b => ({ id: `invoice:${b.id}`, source: 'Billing', sourceId: b.sourceRef, kind: 'invoice', patientKey: b.patientId, visitId: b.visitId, date: b.date, service: 'Clinic services', total: b.total, paid: b.paid, refreshedAt: at })),
+                ...data.invoices.filter(b => validPatients.has(b.patientId) && validVisits.get(b.visitId)?.patientId === b.patientId)
+                    .flatMap(b => (b.payments as any[]).filter(p => p.id && Number.isInteger(p.amount) && p.amount > 0 && Number.isFinite(Date.parse(p.at)))
+                    .map(p => ({ id: `payment:${b.id}:${p.id}`, source: 'Billing', sourceId: p.id, kind: 'payment', patientKey: b.patientId,
+                    visitId: b.visitId, date: clinicDay(new Date(p.at)), service: 'Payment received', total: 0, paid: p.amount, refreshedAt: at }))),
+            ];
+            const statements: any[] = [store.remove("warehouseFacts")];
+            for (let i = 0; i < facts.length; i += 5)
+                statements.push(store.insert("warehouseFacts", facts.slice(i, i + 5)));
+            statements.push(store.insert("warehouseRuns", { id: runId, at, userId: user.id, count: facts.length, summary: { ...summarizeFacts(facts), formatVersion: 2 } }), store.insert("activityHistory", auditRow(user, 'Refreshed reporting copies', 'warehouse', runId, `${facts.length} checked facts copied. Draft results and held imports excluded.`)));
+            await store.batch(statements as any);
+            return { count: facts.length, refreshedAt: at };
+        }, { lock: 20261103, isolationLevel: 'Serializable' });
+    } catch (error) {
+        if (['P2034', '40001'].includes((error as any)?.code))
+            throw new AppError('Records changed during the reporting update. Please update the figures again.', 409);
+        throw error;
+    }
 }

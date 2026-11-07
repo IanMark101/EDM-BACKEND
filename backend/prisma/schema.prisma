@@ -52,7 +52,31 @@ model Patient {
   invoices Invoice[]
   reviews QualityReview[]
   imports SourceImport[]
+  portalAccount PatientPortalAccount?
   @@map("clinic_patients")
+}
+
+model PatientPortalAccount {
+  patientId String @id @map("patient_id")
+  activationHash String? @map("activation_hash")
+  activationExpiresAt String? @map("activation_expires_at")
+  passwordHash String? @map("password_hash")
+  salt String?
+  failedAttempts Int @default(0) @map("failed_attempts")
+  lockedUntil String? @map("locked_until")
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  sessions PatientPortalSession[]
+  @@map("patient_portal_accounts")
+}
+
+model PatientPortalSession {
+  tokenHash String @id @map("token_hash")
+  patientId String @map("patient_id")
+  lastSeen String @map("last_seen")
+  expiresAt String @map("expires_at")
+  account PatientPortalAccount @relation(fields: [patientId], references: [patientId], onDelete: Cascade)
+  @@index([patientId])
+  @@map("patient_portal_sessions")
 }
 
 model Visit {

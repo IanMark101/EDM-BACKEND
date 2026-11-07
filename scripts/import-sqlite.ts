@@ -17,6 +17,7 @@ try {
   const tables: Record<string, any[]> = {};
   try {
     for (const name of snapshotOrder) {
+      if (name === 'patientPortalAccounts' || name === 'patientPortalSessions') { tables[name] = []; continue; }
       const model = models.find(m => m.name[0].toLowerCase() + m.name.slice(1) === modelNames[name])!;
       const fields = model.fields;
       const table = model.dbName || model.name;

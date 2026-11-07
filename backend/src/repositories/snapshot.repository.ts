@@ -1,7 +1,16 @@
 import { getPrisma, createDatabaseClient } from '../config/prisma';
 import { delegate, normalizeRecord, type TableName } from './clinic.repository';
 import { Prisma } from '../generated/prisma/client';
-export const snapshotOrder: TableName[] = ['staffAccounts', 'appSettings', 'patients', 'visits', 'labReports', 'invoices', 'qualityReviews', 'sourceImports', 'warehouseFacts', 'warehouseRuns', 'activityHistory', 'visitWorkflow', 'staffNotifications', 'staffSessions'];
+const originalTables: TableName[] = ['staffAccounts', 'appSettings', 'patients', 'visits', 'labReports', 'invoices', 'qualityReviews', 'sourceImports', 'warehouseFacts', 'warehouseRuns', 'activityHistory', 'visitWorkflow', 'staffNotifications', 'staffSessions'];
+const portalTables: TableName[] = ['patientPortalAccounts', 'patientPortalSessions'];
+export const snapshotOrder = [...originalTables, ...portalTables];
+function primaryKey(name: TableName) {
+  if (name === 'appSettings') return 'key';
+  if (name === 'staffSessions' || name === 'patientPortalSessions') return 'tokenHash';
+  if (name === 'visitWorkflow') return 'visitId';
+  if (name === 'patientPortalAccounts') return 'patientId';
+  return 'id';
+}
 export type ClinicSnapshot = { format: 'care-record-postgresql-v1'; createdAt: string; tables: Record<string, any[]> };
 export async function exportSnapshot(client = getPrisma()): Promise<ClinicSnapshot> {
   return client.$transaction(async tx => {
@@ -11,10 +20,15 @@ export async function exportSnapshot(client = getPrisma()): Promise<ClinicSnapsh
   }, { isolationLevel: 'RepeatableRead', timeout: 120_000 });
 }
 export function validateSnapshot(snapshot: ClinicSnapshot) {
-  if (snapshot?.format !== 'care-record-postgresql-v1' || !snapshot.tables || Object.keys(snapshot.tables).length !== snapshotOrder.length) throw new Error('Unsupported clinic snapshot.');
+  if (snapshot?.format !== 'care-record-postgresql-v1' || !snapshot.tables) throw new Error('Unsupported clinic snapshot.');
+  const names = Object.keys(snapshot.tables);
+  if (names.length === originalTables.length && originalTables.every(name => names.includes(name))) {
+    for (const name of portalTables) snapshot.tables[name] = [];
+  }
+  if (Object.keys(snapshot.tables).length !== snapshotOrder.length) throw new Error('Unsupported clinic snapshot.');
   for (const name of snapshotOrder) {
     const rows = snapshot.tables[name]; if (!Array.isArray(rows)) throw new Error('A clinic table is missing.');
-    const primary = name === 'appSettings' ? 'key' : name === 'staffSessions' ? 'tokenHash' : name === 'visitWorkflow' ? 'visitId' : 'id';
+    const primary = primaryKey(name);
     if (rows.some(row => !row || typeof row[primary] !== 'string') || new Set(rows.map(row => row[primary])).size !== rows.length) throw new Error('Invalid or duplicate record references in snapshot.');
   }
 }
@@ -41,7 +55,7 @@ export async function restoreToSeparateTarget(snapshot: ClinicSnapshot, url: str
     if (JSON.stringify(snapshot.tables.staffAccounts.map(row => row.id)) !== JSON.stringify(restored.tables.staffAccounts.map(row => row.id))) throw new Error('Recovered staff presentation order did not match the snapshot.');
     const canonical = (value: any): any => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])])) : value;
     for (const name of snapshotOrder) {
-      const field = name === 'appSettings' ? 'key' : name === 'staffSessions' ? 'tokenHash' : name === 'visitWorkflow' ? 'visitId' : 'id';
+      const field = primaryKey(name);
       const ordered = (rows: any[]) => [...rows].sort((a, b) => String(a[field]).localeCompare(String(b[field])));
       if (JSON.stringify(canonical(ordered(snapshot.tables[name]))) !== JSON.stringify(canonical(ordered(restored.tables[name])))) throw new Error('Recovered records did not match the encrypted snapshot.');
     }

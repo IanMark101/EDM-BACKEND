@@ -4,6 +4,10 @@ import { ensureSeed } from '../repositories/seed';
 import { requireSameOrigin } from '../services/security';
 import * as clinic from '../services/clinic.service';
 import * as operations from '../services/operations.service';
+import { servicePricesService } from '../services/pricing.service';
+import { historyService } from '../services/history.service';
+import * as portal from '../services/patient-portal.service';
+import { isTemporaryDatabaseError } from '../lib/database-recovery';
 import type { ServiceContext } from '../http/context';
 import type { ServiceResult } from '../http/result';
 type Endpoint = { auth?: boolean; limit?: number; service: (context: ServiceContext) => Promise<ServiceResult | Response | null | undefined> };
@@ -46,6 +50,15 @@ async function clinicController(request: Request, route?: Endpoint): Promise<Res
       if (user && error.status === 403) await audit(user, 'Access refused', 'permission', url.pathname.slice(0, 160), 'Server refused an action outside the staff account permissions.').catch(() => {});
       return responseOf(result({ error: error.message, fields: error.fields }, error.status));
     }
+    if (isTemporaryDatabaseError(error)) {
+      console.warn('Clinic database connection is temporarily unavailable. No write was automatically replayed.');
+      return responseOf(result({
+        code: 'DATABASE_UNAVAILABLE',
+        error: request.method === 'GET'
+          ? 'The database connection was interrupted. Try refreshing the records again.'
+          : 'The database connection was interrupted. Refresh the records to check whether your change was saved before trying again.',
+      }, 503, { 'Retry-After': '1' }));
+    }
     console.error('Clinic request failed:', error instanceof Error ? error.message : 'Unknown error');
     return responseOf(result({ error: 'The request could not be completed. Refresh the page and try again.' }, 500));
   } finally { await finishUnusedBody(request); }
@@ -58,6 +71,12 @@ export const controllers = {
   logout: controller({ service: clinic.logoutService }),
   heartbeat: controller({ service: clinic.heartbeatService }),
   data: controller({ service: clinic.dataService }),
+  history: controller({ service: historyService }),
+  patientAccess: controller({ service: portal.patientAccessService, limit: 20_000 }),
+  patientPortal: controller({ service: portal.patientPortalRecords, auth: false }),
+  patientActivate: controller({ service: portal.activatePatientPortal, auth: false, limit: 20_000 }),
+  patientLogin: controller({ service: portal.loginPatientPortal, auth: false, limit: 20_000 }),
+  patientLogout: controller({ service: portal.logoutPatientPortal, auth: false, limit: 20_000 }),
   reportExport: controller({ service: clinic.reportExportService }),
   recordView: controller({ service: clinic.recordViewService }),
   notifications: controller({ service: clinic.notificationsService }),
@@ -73,6 +92,8 @@ export const controllers = {
   password: controller({ service: operations.passwordService, limit: 20_000 }),
   resetPassword: controller({ service: operations.resetPasswordService, limit: 20_000 }),
   clinicSettings: controller({ service: operations.clinicSettingsService, limit: 20_000 }),
+  servicePrices: controller({ service: servicePricesService, limit: 20_000 }),
   doctorReview: controller({ service: operations.doctorReviewService, limit: 20_000 }),
+  patientResultRelease: controller({ service: operations.patientResultReleaseService, limit: 20_000 }),
   document: controller({ service: operations.documentService, limit: 20_000 }),
 };

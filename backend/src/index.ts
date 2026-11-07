@@ -19,7 +19,8 @@ app.use('/api', async (req, res) => {
     response.headers.forEach((value, name) => { if (name !== 'set-cookie') res.setHeader(name, value); });
     const cookies = response.headers.getSetCookie(); if (cookies.length) res.setHeader('set-cookie', cookies);
     res.end(Buffer.from(await response.arrayBuffer()));
-  } catch {
+  } catch (error) {
+    console.error('Clinic HTTP response failed:', { method: req.method, area: req.path.split('/')[1] || 'unknown', error: error instanceof Error ? error.name : 'Unknown error', code: (error as { code?: string })?.code });
     if (!res.headersSent) res.status(500).json({ error: 'The request could not be completed. Refresh the page and try again.' });
     else res.end();
   }

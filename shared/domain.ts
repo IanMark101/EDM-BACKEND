@@ -4,8 +4,8 @@ export type Staff = { id: string; username: string; name: string; role: Role; ac
 export const ROLE_NAMES: Record<Role, string> = { registration: 'Registration', doctor: 'Doctor', laboratory: 'Laboratory', billing: 'Billing', reviewer: 'Records reviewer', manager: 'Account manager' };
 export const ROLE_DETAILS: Record<Role, string> = {
   registration: 'Register patients and maintain identity and contact details.', doctor: 'Document assigned patient visits and request laboratory tests.',
-  laboratory: 'Complete, review, approve and correct laboratory reports.', billing: 'Prepare itemized bills and record payments.',
-  reviewer: 'Resolve identity questions, review history and prepare checked reports.', manager: 'Create staff accounts and assign responsibilities.',
+  laboratory: 'Complete, review, approve and correct laboratory reports.', billing: 'Bill completed services at approved prices and record payments.',
+  reviewer: 'Resolve identity questions, review history and prepare checked reports.', manager: 'Manage staff access and set the clinic-approved service prices.',
 };
 export class AppError extends Error {
   status: number; fields?: Record<string, string>;

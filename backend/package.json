@@ -8,6 +8,7 @@
     "build": "node ../scripts/build-backend.mjs",
     "start": "node dist/index.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:studio": "prisma studio",

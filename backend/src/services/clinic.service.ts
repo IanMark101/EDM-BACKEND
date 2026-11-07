@@ -1,11 +1,11 @@
-import { repository, match, allOf, oneOf } from '../repositories/clinic.repository';
-import { AppError, assertRole, cleanText, dateOnly, validatePatient, validatePayment, moneyCents, identityKey, labProblems, ROLES, publicStaff, csvCell, type Staff } from '../../../shared/domain';
+import { repository, match, allOf, oneOf, type ClinicRepository } from '../repositories/clinic.repository';
+import { AppError, assertRole, cleanText, dateOnly, validatePatient, moneyCents, identityKey, labProblems, ROLES, publicStaff, csvCell, type Staff } from '../../../shared/domain';
 import { authenticate, audit, auditRow, now, newId, visibleData, permittedPatient, loadAll, updateWithHistory, refreshWarehouse } from './server';
 import { ensureSeed } from '../repositories/seed';
 import { hashPassword, randomToken, constantEqual, digest, SESSION_MS, sessionCookie, cookieToken, requireSameOrigin } from './security';
 import { notificationRows, notificationInsert } from './notifications';
 import { cleanClinical, cleanMeasurements, LAB_LAYOUTS } from '../../../shared/clinical';
-import { createBillOnce } from '../repositories/billing.repository';
+import { managedInvoicesService, pricedImportItems } from './billing.service';
 import { result } from '../http/result';
 import type { ServiceContext } from '../http/context';
 function requiredRow<T>(row: T | undefined): T { if (!row)
@@ -15,43 +15,46 @@ function evidence(value: unknown) { const reason = cleanText(value, 'Reason or e
 function invoiceItems(items: any) {
     if (!Array.isArray(items) || !items.length || items.length > 12)
         throw new AppError('Add between 1 and 12 charge items.', 422);
-    return items.map(item => ({ description: cleanText(item.description, 'Service description', 160), amount: moneyCents(item.amount, 'Charge') }));
+    return items.map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) throw new AppError('Each charge item must contain a service description and amount.', 422);
+        return { description: cleanText(item.description, 'Service description', 160), amount: moneyCents(item.amount, 'Charge') };
+    });
 }
-async function syncLabReview(report: any, visit: any, user: Staff) {
-    const open = await repository.find("qualityReviews", allOf(match("recordId", report.id), match("state", 'open')));
+async function syncLabReview(report: any, visit: any, user: Staff, store: ClinicRepository = repository) {
+    const open = await store.find("qualityReviews", allOf(match("recordId", report.id), match("state", 'open')));
     const problems = labProblems(report, visit);
     if (!problems.length) {
         if (open.length)
-            await repository.update("qualityReviews", { state: 'resolved', resolvedAt: now(), resolvedBy: user.name, resolution: 'Required laboratory details checked.', evidence: 'Patient, visit, result, unit and collection time were checked by laboratory staff.' }, allOf(match("recordId", report.id), match("state", 'open')));
+            await store.update("qualityReviews", { state: 'resolved', resolvedAt: now(), resolvedBy: user.name, resolution: 'Required laboratory details checked.', evidence: 'Patient, visit, result, unit and collection time were checked by laboratory staff.' }, allOf(match("recordId", report.id), match("state", 'open')));
     }
     else if (!open.length) {
         const issueId = newId('Q');
-        const notices = await notificationRows(user, { key: `quality:${issueId}`, roles: ['reviewer', 'laboratory'], kind: 'due', body: 'saved a report that needs details:', subject: report.id, patientId: report.patientId, entityId: issueId, href: `/clinic/review?open=${issueId}` });
+        const notices = await notificationRows(user, { key: `quality:${issueId}`, roles: ['reviewer', 'laboratory'], kind: 'due', body: 'saved a report that needs details:', subject: report.id, patientId: report.patientId, entityId: issueId, href: `/clinic/review?open=${issueId}` }, store);
         // Laboratory recipients open the report itself, rather than the reviewer's screen.
         notices.forEach(n => { if (n.recipientRole === 'laboratory')
             n.href = `/clinic/laboratory?open=${report.id}`; });
-        await repository.batch([repository.insert("qualityReviews", { id: issueId, kind: 'lab', patientId: report.patientId, recordId: report.id, title: 'Laboratory details incomplete', detail: problems.join(' '), ownerRole: 'laboratory', createdAt: now() }), ...notificationInsert(notices)]);
+        await store.batch([store.insert("qualityReviews", { id: issueId, kind: 'lab', patientId: report.patientId, recordId: report.id, title: 'Laboratory details incomplete', detail: problems.join(' '), ownerRole: 'laboratory', createdAt: now() }), ...notificationInsert(notices)]);
     }
 }
-async function materializeImport(imported: any, patientId: string, visitId: string, user: Staff) {
-    const p = imported.payload;
-    const visit = requiredRow((await repository.find("visits", match("id", visitId)))[0]);
+async function materializeImport(imported: any, patientId: string, visitId: string, user: Staff, store: ClinicRepository = repository) {
+    const p = cleanImportPayload(imported.source, imported.payload);
+    const visit = requiredRow((await store.find("visits", match("id", visitId)))[0]);
     if (visit.patientId !== patientId)
         throw new AppError('The selected visit belongs to another patient.', 422);
     const id = `${imported.source === 'laboratory' ? 'L' : 'B'}-IMP-${imported.externalId}`;
-    if (imported.source === 'laboratory') {
+    if ('testName' in p) {
         const report = { id, patientId, visitId, testName: cleanText(p.testName, 'Test name', 120), value: cleanText(p.value, 'Result', 3000, false), unit: cleanText(p.unit, 'Unit', 80, false), collectedAt: cleanText(p.collectedAt, 'Collection time', 40, false), status: 'draft', requestedBy: visit.doctorId, sourceRef: imported.externalId, updatedAt: now() };
-        await repository.batch([repository.insert("labReports", report), repository.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), repository.insert("activityHistory", auditRow(user, 'Received laboratory record', 'import', imported.externalId, 'Source reference retained. Report saved as a draft for laboratory review.', patientId))]);
-        await syncLabReview(report, visit, user);
+        await store.batch([store.insert("labReports", report), store.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), store.insert("activityHistory", auditRow(user, 'Received laboratory record', 'import', imported.externalId, 'Source reference retained. Report saved as a draft for laboratory review.', patientId))]);
+        await syncLabReview(report, visit, user, store);
     }
     else {
         if (visit.status !== 'signed')
             throw new AppError('The consultation must be completed before a bill can be received for this visit.', 422);
-        if ((await repository.find("invoices", match("visitId", visit.id))).length)
+        if ((await store.find("invoices", match("visitId", visit.id))).length)
             throw new AppError('This visit already has a bill. Billing staff must check it and use Add a charge for a later service, rather than receive a second bill.', 409);
-        const items = invoiceItems(p.items);
+        const items = await pricedImportItems(visit, p.items, user, store);
         const total = items.reduce((sum: number, item: any) => sum + item.amount, 0);
-        await repository.batch([repository.insert("invoices", { id, patientId, visitId, date: dateOnly(p.date, 'Bill date'), items, total, sourceRef: imported.externalId, updatedAt: now() }), repository.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), repository.insert("activityHistory", auditRow(user, 'Received billing record', 'import', imported.externalId, 'A checked source bill was linked to the selected patient and visit.', patientId))]);
+        await store.batch([store.insert("invoices", { id, patientId, visitId, date: dateOnly(p.date, 'Bill date'), items, total, sourceRef: imported.externalId, updatedAt: now() }), store.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), store.insert("activityHistory", auditRow(user, 'Received billing record', 'import', imported.externalId, 'A checked source bill was linked to the selected patient and visit.', patientId))]);
     }
 }
 export async function loginService(context: ServiceContext) {
@@ -302,149 +305,120 @@ export async function labsService(context: ServiceContext) {
     return result({ id });
 }
 export async function invoicesService(context: ServiceContext) {
-    let { request, user, id, action, input, url } = context;
-    assertRole(user, ['billing']);
-    
-    if (!id) {
-        const patient = requiredRow((await repository.find("patients", match("id", input.patientId)))[0]);
-        const visit = requiredRow((await repository.find("visits", match("id", input.visitId)))[0]);
-        if (visit.patientId !== patient.id)
-            throw new AppError('The visit belongs to a different patient.', 422);
-        if (visit.status !== 'signed')
-            throw new AppError('The doctor must complete the consultation before a bill is prepared.', 422);
-        const existing = (await repository.find("invoices", match("visitId", visit.id)))[0];
-        if (existing)
-            throw new AppError(`This visit already has bill ${existing.id}. Open that bill to record a payment or add a charge.`, 409);
-        const items = invoiceItems(input.items);
-        const invoiceId = newId('B');
-        const notices = await notificationRows(user, { key: `bill:${invoiceId}`, roles: ['billing'], kind: 'created', body: 'prepared a bill for', subject: patient.name, patientId: patient.id, entityId: invoiceId, href: `/clinic/billing?open=${invoiceId}` });
-        const values = { id: invoiceId, patientId: patient.id, visitId: visit.id, date: dateOnly(input.date, 'Bill date'),
-            items: JSON.stringify(items), total: items.reduce((sum: number, item: any) => sum + item.amount, 0), paid: 0,
-            payments: '[]', sourceRef: newId('BILL'), version: 1, updatedAt: now() };
-        const event = auditRow(user, 'Created bill', 'invoice', invoiceId, 'Itemized charges calculated from the saved service amounts.', patient.id);
-        await createBillOnce(values, invoiceId, visit.id, event, notices);
-        return result({ id: invoiceId }, 201);
-    }
-    if (action === 'add-charges') {
-        const inputItems = invoiceItems(input.items);
-        const reason = evidence(input.reason);
-        const old = requiredRow((await repository.find("invoices", match("id", id)))[0]);
-        const items = [...old.items as any[], ...inputItems];
-        if (items.length > 24)
-            throw new AppError('This bill has reached its service limit. Contact the records reviewer.', 422);
-        await updateWithHistory("invoices", old, input.version, { items, total: items.reduce((sum, item) => sum + item.amount, 0) }, auditRow(user, 'Added bill charges', 'invoice', id, `Additional charges recorded. Reason: ${reason}`, old.patientId));
-        return result({ id });
-    }
-    if (action !== 'payment')
-        throw new AppError('Choose a payment action.', 404);
-    const old = requiredRow((await repository.find("invoices", match("id", id)))[0]);
-    const amount = validatePayment(input.amount, old.total, old.paid);
-    const method = cleanText(input.method, 'Payment method', 40);
-    if (!['Cash', 'Card', 'Bank transfer'].includes(method))
-        throw new AppError('Choose a listed payment method.', 422);
-    const reference = cleanText(input.reference, 'Payment reference', 120, method !== 'Cash');
-    const payments = [...old.payments as any[], { id: newId('PAY'), amount, method, reference, by: user.name, at: now() }];
-    const patient = requiredRow((await repository.find("patients", match("id", old.patientId)))[0]);
-    const notices = await notificationRows(user, { key: `payment:${payments[payments.length - 1].id}`, roles: ['billing'], kind: 'created', body: 'recorded a payment for', subject: patient.name, patientId: patient.id, entityId: id, href: `/clinic/billing?open=${id}` });
-    await updateWithHistory("invoices", old, input.version, { paid: old.paid + amount, payments }, auditRow(user, 'Recorded payment', 'invoice', id, `${(amount / 100).toFixed(2)} PHP received by ${method}.`, old.patientId), notices);
-    return result({ id });
+    return managedInvoicesService(context);
 }
 export async function reviewsService(context: ServiceContext) {
     let { request, user, id, action, input, url } = context;
     assertRole(user, ['reviewer', 'registration']);
     
     const reason = evidence(input.evidence);
-    const review = requiredRow((await repository.find("qualityReviews", match("id", id)))[0]);
-    if (review.state !== 'open')
-        throw new AppError('This review has already been resolved.', 409);
-    if (review.kind !== 'identity')
-        throw new AppError('Laboratory details must be corrected and checked by laboratory staff.', 403);
-    const imported = requiredRow((await repository.find("sourceImports", match("id", review.recordId)))[0]);
-    if (input.decision === 'link') {
-        const patient = requiredRow((await repository.find("patients", match("id", input.patientId)))[0]);
-        if (cleanText(input.confirmedDob, 'Verified birth date', 10) !== patient.dob)
-            throw new AppError('The verified birth date does not match the selected patient. Keep the records separate until confirmed.', 422);
-        await materializeImport(imported, patient.id, cleanText(input.visitId, 'Verified visit', 80), user);
+    return repository.transaction(async store => {
+        const review = requiredRow((await store.find("qualityReviews", match("id", id)))[0]);
+        if (review.state !== 'open')
+            throw new AppError('This review has already been resolved.', 409);
+        if (review.kind !== 'identity')
+            throw new AppError('Laboratory details must be corrected and checked by laboratory staff.', 403);
+        const imported = requiredRow((await store.find("sourceImports", match("id", review.recordId)))[0]);
+        if (input.decision === 'link') {
+            const patient = requiredRow((await store.find("patients", match("id", input.patientId)))[0]);
+            if (cleanText(input.confirmedDob, 'Verified birth date', 10) !== patient.dob)
+                throw new AppError('The verified birth date does not match the selected patient. Keep the records separate until confirmed.', 422);
+            await materializeImport(imported, patient.id, cleanText(input.visitId, 'Verified visit', 80), user, store);
+        }
+        else if (input.decision === 'keep-separate')
+            await store.update("sourceImports", { state: 'kept-separate' }, match("id", imported.id));
+        else
+            throw new AppError('Choose to link the confirmed record or keep it separate.', 422);
+        const notices = await notificationRows(user, { key: `identity-resolved:${id}`, roles: [imported.source as 'laboratory' | 'billing', 'reviewer'], kind: 'edit', body: 'resolved the patient match for', subject: imported.externalId, entityId: id, href: '/clinic/sources' }, store);
+        await store.batch([store.update("qualityReviews", { state: 'resolved', resolution: input.decision === 'link' ? 'Identity confirmed and source record linked.' : 'Kept separate after identity review.', evidence: reason, resolvedBy: user.name, resolvedAt: now() }, match("id", id)), store.insert("activityHistory", auditRow(user, 'Resolved identity review', 'review', id, `${input.decision}: ${reason}`, review.patientId || undefined)), ...notificationInsert(notices)]);
+        return result({ id });
+    }, { lock: 20261105 });
+}
+// Keep source values canonical before matching or saving. Collection times must
+// identify an instant; an offset-free source string depends on the host timezone.
+function cleanImportPayload(source: string, value: any) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        throw new AppError('Each source record must be a JSON object.', 422);
+    const externalId = cleanText(value.externalId, 'Source record number', 32);
+    if (!/^[a-zA-Z0-9_-]+$/.test(externalId))
+        throw new AppError('Source record numbers may contain only letters, digits, hyphens and underscores.', 422);
+    const payload = { externalId, patientId: cleanText(value.patientId, 'Patient number', 80),
+        patientName: cleanText(value.patientName, 'Patient name', 120),
+        patientDob: value.patientDob ? dateOnly(value.patientDob, 'Birth date') : '',
+        visitId: cleanText(value.visitId, 'Visit number', 80) };
+    if (source === 'laboratory') {
+        const collectedAt = cleanText(value.collectedAt, 'Collection time', 40, false);
+        if (collectedAt && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/i.test(collectedAt) || !Number.isFinite(Date.parse(collectedAt))))
+            throw new AppError(`Record ${externalId}: collection time must be valid ISO 8601 with Z or an explicit timezone offset.`, 422);
+        if (collectedAt) dateOnly(collectedAt.slice(0, 10), 'Collection date', true);
+        return { ...payload, testName: cleanText(value.testName, 'Test name', 120),
+            value: cleanText(value.value, 'Result', 3000, false), unit: cleanText(value.unit, 'Unit', 80, false),
+            collectedAt: collectedAt ? new Date(collectedAt).toISOString() : '' };
     }
-    else if (input.decision === 'keep-separate')
-        await repository.update("sourceImports", { state: 'kept-separate' }, match("id", imported.id));
-    else
-        throw new AppError('Choose to link the confirmed record or keep it separate.', 422);
-    const notices = await notificationRows(user, { key: `identity-resolved:${id}`, roles: [imported.source as 'laboratory' | 'billing', 'reviewer'], kind: 'edit', body: 'resolved the patient match for', subject: imported.externalId, entityId: id, href: '/clinic/sources' });
-    await repository.batch([repository.update("qualityReviews", { state: 'resolved', resolution: input.decision === 'link' ? 'Identity confirmed and source record linked.' : 'Kept separate after identity review.', evidence: reason, resolvedBy: user.name, resolvedAt: now() }, match("id", id)), repository.insert("activityHistory", auditRow(user, 'Resolved identity review', 'review', id, `${input.decision}: ${reason}`, review.patientId || undefined)), ...notificationInsert(notices)]);
-    return result({ id });
+    // Validate amounts here; materialization converts these decimal amounts to cents.
+    const items = invoiceItems(value.items);
+    return { ...payload, date: dateOnly(value.date, 'Bill date'),
+        items: items.map(item => ({ description: item.description, amount: (item.amount / 100).toFixed(2) })) };
 }
 export async function importsService(context: ServiceContext) {
-    let { request, user, id, action, input, url } = context;
-    
+    const { user, input } = context;
     const source = input.source;
     if (!['laboratory', 'billing'].includes(source))
         throw new AppError('Choose laboratory or billing as the source.', 422);
     assertRole(user, [source]);
     if (!Array.isArray(input.records) || !input.records.length || input.records.length > 50)
         throw new AppError('Import between 1 and 50 records.', 422);
-    const all = await loadAll();
-    let importedCount = 0, held = 0, skipped = 0;
-    const plannedBills = new Map<string, string>();
-    // Validate every source row before any write; errors never leave a half-validated file.
-    const normalized = input.records.map((p: any) => {
-        const externalId = cleanText(p.externalId, 'Source record number', 32);
-        if (!/^[a-zA-Z0-9_-]+$/.test(externalId))
-            throw new AppError('Source record numbers may contain only letters, digits, hyphens and underscores.', 422);
-        cleanText(p.patientId, 'Patient number', 80);
-        cleanText(p.patientName, 'Patient name', 120);
-        cleanText(p.visitId, 'Visit number', 80);
-        if (p.patientDob)
-            dateOnly(p.patientDob, 'Birth date');
-        if (source === 'laboratory') {
-            cleanText(p.testName, 'Test name', 120);
-            cleanText(p.value, 'Result', 3000, false);
-            cleanText(p.unit, 'Unit', 80, false);
-            cleanText(p.collectedAt, 'Collection time', 40, false);
-            if (p.collectedAt && !Number.isFinite(Date.parse(p.collectedAt)))
-                throw new AppError('A source collection time is invalid.', 422);
-        }
-        else {
-            invoiceItems(p.items);
-            dateOnly(p.date, 'Bill date');
-            const patient = all.patients.find(person => person.id === p.patientId);
-            const matched = patient && patient.dob === p.patientDob && identityKey(patient.name) === identityKey(p.patientName);
-            if (matched && !all.imports.some(i => i.source === 'billing' && i.externalId === externalId)) {
-                if (all.invoices.some(b => b.visitId === p.visitId) || plannedBills.has(p.visitId) && plannedBills.get(p.visitId) !== externalId)
-                    throw new AppError('A visit in this file already has a bill. Open that bill and check the charges before adding a later service.', 409);
-                plannedBills.set(p.visitId, externalId);
+    try {
+        const normalized = input.records.map((row: any) => cleanImportPayload(source, row));
+        // All rows, held-review tasks, audit entries and notifications commit together.
+        // The same lock covers identity decisions, so a retry cannot race a review.
+        return await repository.transaction(async store => {
+            const [patients, visits, imports] = await Promise.all([
+                store.find('patients'), store.find('visits'), store.find('sourceImports', match('source', source)),
+            ]);
+            let importedCount = 0, held = 0, skipped = 0;
+            const seen = new Set<string>();
+            for (const supplied of normalized) {
+                if (seen.has(supplied.externalId)) { skipped++; continue; }
+                seen.add(supplied.externalId);
+                const existing = imports.find(row => row.externalId === supplied.externalId);
+                // Previously failed staging rows can be recovered by resubmitting the
+                // file. Preserve their original payload and any human identity decision.
+                if (existing && (existing.state !== 'held' || (await store.find('qualityReviews', allOf(match('recordId', existing.id), match('kind', 'identity')))).length)) {
+                    skipped++; continue;
+                }
+                const payload = existing ? cleanImportPayload(source, existing.payload) : supplied;
+                const patient = patients.find(row => row.id === payload.patientId);
+                const visit = visits.find(row => row.id === payload.visitId);
+                const matches = patient && patient.dob === payload.patientDob && identityKey(patient.name) === identityKey(payload.patientName) && visit?.patientId === patient.id;
+                const row = existing || { id: newId('IMP'), source, externalId: payload.externalId, payload, state: 'held', receivedAt: now() };
+                if (!existing) await store.insert('sourceImports', row);
+                if (matches) {
+                    try { await materializeImport({ ...row, payload }, patient.id, visit.id, user, store); }
+                    catch (error) {
+                        if (error instanceof AppError) throw new AppError(`Record ${payload.externalId}: ${error.message}`, error.status);
+                        throw error;
+                    }
+                    importedCount++;
+                } else {
+                    const issueId = newId('Q');
+                    const notices = await notificationRows(user, { key: `identity-held:${row.id}`, roles: ['registration', 'reviewer'], kind: 'due', body: 'received a record that needs an identity check:', subject: payload.externalId, entityId: issueId, href: `/clinic/review?open=${issueId}` }, store);
+                    await store.batch([
+                        store.insert('qualityReviews', { id: issueId, kind: 'identity', patientId: patient?.id || null, recordId: row.id, title: 'Confirm the source patient', detail: `${source === 'laboratory' ? 'Laboratory' : 'Billing'} source ${payload.externalId} could not be safely matched. Check the patient number, name, birth date and visit.`, ownerRole: 'registration', createdAt: now() }),
+                        store.insert('activityHistory', auditRow(user, 'Held source record for checking', 'import', payload.externalId, 'Identity or visit details did not match. Nothing was automatically combined.')),
+                        ...notificationInsert(notices),
+                    ]);
+                    held++;
+                }
             }
-        }
-        return { ...p, externalId };
-    });
-    const seen = new Set<string>();
-    for (const payload of normalized) {
-        if (seen.has(payload.externalId) || all.imports.some(i => i.source === source && i.externalId === payload.externalId)) {
-            skipped++;
-            continue;
-        }
-        seen.add(payload.externalId);
-        const patient = all.patients.find(p => p.id === payload.patientId);
-        const visit = all.visits.find(v => v.id === payload.visitId);
-        const matches = patient && patient.dob === payload.patientDob && identityKey(patient.name) === identityKey(payload.patientName) && visit?.patientId === patient.id;
-        const row = { id: newId('IMP'), source, externalId: payload.externalId, payload, state: 'held', receivedAt: now() };
-        const received = await repository.insert("sourceImports", row, { ignore: true });
-        if (!received.meta.changes) {
-            skipped++;
-            continue;
-        }
-        if (matches) {
-            await materializeImport(row, patient.id, visit.id, user);
-            importedCount++;
-        }
-        else {
-            const issueId = newId('Q');
-            const notices = await notificationRows(user, { key: `identity-held:${row.id}`, roles: ['registration', 'reviewer'], kind: 'due', body: 'received a record that needs an identity check:', subject: payload.externalId, entityId: issueId, href: `/clinic/review?open=${issueId}` });
-            await repository.batch([repository.insert("qualityReviews", { id: issueId, kind: 'identity', patientId: patient?.id || null, recordId: row.id, title: 'Confirm the source patient', detail: `${source === 'laboratory' ? 'Laboratory' : 'Billing'} source ${payload.externalId} could not be safely matched. Check the patient number, name, birth date and visit.`, ownerRole: 'registration', createdAt: now() }), repository.insert("activityHistory", auditRow(user, 'Held source record for checking', 'import', payload.externalId, 'Identity or visit details did not match. Nothing was automatically combined.')), ...notificationInsert(notices)]);
-            held++;
-        }
+            return result({ imported: importedCount, held, skipped });
+        }, { lock: 20261105 });
+    } catch (error) {
+        if (error instanceof AppError) throw new AppError(`No records from this file were saved. ${error.message}`, error.status);
+        if (['P2002', 'P2034'].includes((error as any)?.code))
+            throw new AppError('No records from this file were saved. Another staff action changed the source records or bills. Refresh and retry the file.', 409);
+        throw error;
     }
-    return result({ imported: importedCount, held, skipped });
 }
 export async function warehouseService(context: ServiceContext) {
     let { request, user, id, action, input, url } = context;

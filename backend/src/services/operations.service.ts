@@ -1,5 +1,5 @@
 import { repository, match, allOf, oneOf } from '../repositories/clinic.repository';
-import { AppError, assertRole, cleanText, type Staff } from '../../../shared/domain';
+import { AppError, assertRole, cleanText, labProblems, type Staff } from '../../../shared/domain';
 import { hashPassword, constantEqual, randomToken, sessionCookie } from './security';
 import { audit, auditRow, loadAll, now, permittedPatient, updateWithHistory } from './server';
 import { needsDoctorReview } from '../../../shared/clinical';
@@ -80,6 +80,21 @@ export async function doctorReviewService(context: ServiceContext) {
         throw new AppError('Enter a valid follow-up date.', 422);
     const doctorReview = { reportApprovedAt: old.approvedAt, reviewedAt: now(), reviewedBy: user.name, reviewedById: user.id, plan, followUpDate };
     await updateWithHistory("labReports", old, input.version, { doctorReview }, auditRow(user, 'Reviewed approved laboratory report', 'lab', id, 'Doctor review and follow-up decision recorded for this approved version.', old.patientId));
+    return result({ ok: true });
+}
+
+export async function patientResultReleaseService({ user, id, input }: ServiceContext) {
+    assertRole(user, ['doctor']);
+    const report = (await repository.find('labReports', match('id', id)))[0];
+    if (!report) throw new AppError('This report was not found.', 404);
+    const { patient, data } = await permittedPatient(user, report.patientId);
+    if (patient.doctorId !== user.id) throw new AppError('This report is outside your patient assignment.', 403);
+    const review = report.doctorReview as { reviewedAt?: string; reportApprovedAt?: string; releasedAt?: string } | null;
+    const visit = data.visits.find(row => row.id === report.visitId && row.patientId === patient.id);
+    if (report.status !== 'approved' || !review?.reviewedAt || review.reportApprovedAt !== report.approvedAt || !visit || visit.status === 'cancelled' || labProblems(report, visit).length) throw new AppError('Complete the review of the current approved result before releasing it.', 422);
+    if (review.releasedAt) return result({ ok: true });
+    if (input.confirmed !== true) throw new AppError('Confirm release to the patient portal.', 422);
+    await updateWithHistory('labReports', report, input.version, { doctorReview: { ...review, releasedAt: now() } }, auditRow(user, 'Released laboratory report to patient', 'lab', id, 'Assigned doctor released the reviewed report to the patient portal.', patient.id));
     return result({ ok: true });
 }
 export async function documentService(context: ServiceContext) {

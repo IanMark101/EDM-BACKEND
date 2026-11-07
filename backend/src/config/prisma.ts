@@ -6,7 +6,11 @@ let client: PrismaClient | undefined;
 export function createDatabaseClient(url: string) {
   const connection = new URL(url);
   if (['require', 'prefer', 'verify-ca'].includes(connection.searchParams.get('sslmode') || '')) connection.searchParams.set('sslmode', 'verify-full');
-  return new PrismaClient({ adapter: new PrismaPg({ connectionString: connection.toString(), connectionTimeoutMillis: 30_000, max: 10 }, { schema: connection.searchParams.get('schema') || 'public' }), transactionOptions: { maxWait: 30_000, timeout: 60_000 }, log: [] });
+  return new PrismaClient({ adapter: new PrismaPg({
+    connectionString: connection.toString(), connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 10_000, maxLifetimeSeconds: 300, max: 10,
+    keepAlive: true, keepAliveInitialDelayMillis: 10_000,
+  }, { schema: connection.searchParams.get('schema') || 'public' }), transactionOptions: { maxWait: 30_000, timeout: 60_000 }, log: [] });
 }
 export function getPrisma() {
   if (!environment.databaseUrl) throw new AppError('Configure the Neon database connection in backend/.env before signing in.', 503);
