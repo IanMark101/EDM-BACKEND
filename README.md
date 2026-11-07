@@ -20,6 +20,32 @@ The API listens on port 3001. Start [EDM-FRONTEND](https://github.com/IanMark101
 
 The `shared/` folder contains the types and rules used by both applications. Keep it synchronized with the other CareRecord repository when updating it.
 
+## Railway deployment
+
+Prepare a separate empty Neon database for the hosted app. The local practice database has shared demo credentials. The public API requires a clinic initialized with an individual manager account.
+
+1. In a separate local checkout, configure the new database in `backend/.env`. Set `DATABASE_URL` to the pooled URL and `DIRECT_URL` to the direct URL for the same database. From the repository root, run `npm ci` and `npm run db:migrate`.
+2. Run `npm run clinic:initialize` with a private JSON object on standard input. Supply `name`, `username`, `clinicName`, and a unique `password` of at least 12 characters. For example, from PowerShell:
+
+   ```powershell
+   $managerPassword = Read-Host 'New manager password' -AsSecureString
+   $managerCredentials = [pscredential]::new('clinic-manager', $managerPassword)
+   try {
+     @{
+       name = 'Clinic Manager'
+       username = $managerCredentials.UserName
+       clinicName = 'CareRecord Clinic'
+       password = $managerCredentials.GetNetworkCredential().Password
+     } | ConvertTo-Json -Compress | npm run clinic:initialize
+   } finally {
+     Remove-Variable managerPassword, managerCredentials
+   }
+   ```
+
+3. Connect this GitHub repository to Railway with the repository root `/`. Railway builds the included `Dockerfile`. Use its default start command and the port Railway supplies. Set **Pre-Deploy Command** to `npm run db:migrate` and **Healthcheck Path** to `/api/health`.
+4. In Railway Variables, set `DATABASE_URL`, `DIRECT_URL`, and `CLINIC_FRONTEND_ORIGINS`. Use the exact Vercel origin, such as `https://your-care-record.vercel.app`, for `CLINIC_FRONTEND_ORIGINS`. Generate the Railway public domain and verify that `/api/health` returns `ok: true`. The container uses Neon for persistent storage. Configure backups in Neon or use a separate durable backup setup.
+5. Set the Railway HTTPS origin as `CLINIC_API_ORIGIN` on Vercel. After signing in to the hosted app, use the account manager to create individual staff accounts and enter approved prices.
+
 ## Import behavior and checks
 
 Department JSON imports commit the whole file together, including held identity reviews, audit entries and notifications. If a row fails, no changes from that file are saved; correct the cause and resubmit. A previously stranded held source row without an identity-review decision is retried using its stored payload. Imported or reviewed source references remain protected from replacement by a later file.

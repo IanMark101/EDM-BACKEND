@@ -3,8 +3,33 @@ import { Readable } from 'node:stream';
 import { routeRequest } from './routes/clinic.routes';
 import { environment } from './config/environment';
 import { disconnectDatabase } from './config/prisma';
+import { match, repository } from './repositories/clinic.repository';
 import { startAutomaticBackups } from './services/backup.service';
 import { attachNotificationSockets } from './realtime/notifications';
+
+if (!['127.0.0.1', '::1', 'localhost'].includes(environment.host)) {
+  // The local practice database has shared credentials. Require individual
+  // clinic setup before accepting traffic on a public interface.
+  if (environment.seedTestData) {
+    console.error('Turn off CLINIC_SEED_TEST_DATA before exposing the clinic API.');
+    process.exit(1);
+  }
+  let initialized = false;
+  try {
+    const [mode] = await repository.find('appSettings', match('key', 'clinic-mode'));
+    initialized = mode?.value === 'production';
+  } catch {
+    console.error('Hosted startup could not read the clinic settings. Check the database connection and migrations.');
+    await disconnectDatabase();
+    process.exit(1);
+  }
+  if (!initialized) {
+    console.error('Hosted startup requires a clinic initialized with individual staff accounts. Use an empty database and run npm run clinic:initialize.');
+    await disconnectDatabase();
+    process.exit(1);
+  }
+}
+
 const app = express();
 app.disable('x-powered-by');
 app.use('/api', async (req, res) => {
@@ -26,7 +51,7 @@ app.use('/api', async (req, res) => {
   }
 });
 app.use((_req, res) => res.status(404).json({ error: 'This action could not be found.' }));
-const server = app.listen(environment.port, '127.0.0.1', () => console.log('Express API ready at http://localhost:' + environment.port));
+const server = app.listen(environment.port, environment.host, () => console.log(`Express API listening on ${environment.host}:${environment.port}`));
 const stopNotifications = attachNotificationSockets(server);
 const stopBackups = startAutomaticBackups();
 let stopping = false;
