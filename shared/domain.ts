@@ -55,6 +55,7 @@ export function labProblems(report: any, visit: any): string[] {
       const clinicDate = clinicDay(new Date(t));
       if (visit?.date && clinicDate < visit.date) problems.push('Collection date is earlier than this visit. Check the dates.'); } }
   if (!visit || visit.patientId !== report.patientId) problems.push('The patient and visit must match.');
+  else if (visit.status === 'waiting' || visit.status === 'cancelled') problems.push('A laboratory report needs a started or completed consultation.');
   return problems;
 }
 export function moneyCents(value: unknown, label = 'Amount'): number {

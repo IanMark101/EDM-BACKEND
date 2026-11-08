@@ -109,13 +109,17 @@ function createRepository(client: () => Transaction, completed: (writes: WriteRe
 export type ClinicRepository = ReturnType<typeof createRepository>;
 export const repository = {
   ...createRepository(getPrisma, publishCommittedWrites),
-  async transaction<T>(work: (store: ClinicRepository) => Promise<T>, options: { lock: number; isolationLevel?: Prisma.TransactionIsolationLevel }): Promise<T> {
+  async transaction<T>(work: (store: ClinicRepository) => Promise<T>, options: { lock?: number | string; isolationLevel?: Prisma.TransactionIsolationLevel } = {}): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       const writes: WriteResult[] = [];
       try {
         const value = await getPrisma().$transaction(async tx => {
           // Serialize competing imports/reviews or warehouse refreshes before reading.
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(${options.lock}::bigint)`;
+          if (typeof options.lock === 'string') {
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${options.lock}::text, 0))`;
+          } else if (options.lock !== undefined) {
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(${options.lock}::bigint)`;
+          }
           return work(createRepository(() => tx, committed => writes.push(...committed), true));
         }, { timeout: 60_000, ...(options.isolationLevel ? { isolationLevel: options.isolationLevel } : {}) });
         // Live updates must describe committed data, never intermediate writes.

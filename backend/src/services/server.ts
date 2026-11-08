@@ -66,7 +66,8 @@ export async function visibleData(user: Staff) {
         && (user.role !== 'laboratory' || labVisitIds.has(v.id))
         && (user.role !== 'billing' || v.billingReadyAt || billedVisitIds.has(v.id)))
         .map(v => user.role === 'doctor' ? v : ({ id: v.id, patientId: v.patientId, doctorId: v.doctorId,
-        date: v.date, status: v.status, checkedInAt: v.checkedInAt, billingReadyAt: v.billingReadyAt }));
+        date: v.date, status: v.status, checkedInAt: v.checkedInAt, billingReadyAt: v.billingReadyAt,
+        ...(user.role === 'registration' ? { version: v.version } : {}) }));
     const reviewSummary = (review: any) => review?.reviewedAt ? { reportApprovedAt: review.reportApprovedAt, reviewedAt: review.reviewedAt, reviewedBy: review.reviewedBy } : {};
     const labs = user.role === 'laboratory' ? data.labs.map(l => ({ ...l, doctorReview: reviewSummary(l.doctorReview), history: (l.history as any[]).map(h => ({ ...h, doctorReview: reviewSummary(h.doctorReview) })) })) : user.role === 'doctor' ? data.labs.filter(l => ids.has(l.patientId)).map(l => l.status === 'approved' ? l : ({ id: l.id, patientId: l.patientId, visitId: l.visitId, testName: l.testName, status: l.status, sourceRef: l.sourceRef, updatedAt: l.updatedAt })) : [];
     const invoices = user.role === 'billing' ? data.invoices : [];

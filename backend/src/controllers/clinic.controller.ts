@@ -14,16 +14,28 @@ type Endpoint = { auth?: boolean; limit?: number; service: (context: ServiceCont
 import { responseOf, result } from '../http/result';
 
 async function bodyOf(request: Request, limit = 100_000) {
-  const text = await request.text();
-  if (text.length > limit) throw new AppError(limit === 20_000 ? 'This submission is too large.' : 'This file is too large. Import at most 50 records at a time.', 413);
+  const tooLarge = () => new AppError(limit === 20_000 ? 'This submission is too large.' : 'This file is too large. Import at most 50 records at a time.', 413);
+  if (Number(request.headers.get('content-length')) > limit) throw tooLarge();
+  const reader = request.body?.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytes = 0;
+  if (reader) {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.byteLength;
+        if (bytes > limit) throw tooLarge();
+        text += decoder.decode(chunk.value, { stream: true });
+      }
+      text += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
+  }
   try { const value = JSON.parse(text); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(); return value; }
   catch { throw new AppError('The request must contain a valid JSON object.', 400); }
-}
-async function finishUnusedBody(request: Request) {
-  if (request.bodyUsed || !request.body) return;
-  const reader = request.body.getReader(); let bytes = 0;
-  try { while (bytes <= 100_000) { const chunk = await reader.read(); if (chunk.done) return; bytes += chunk.value.byteLength; } await reader.cancel(); }
-  catch { /* Disconnected caller. */ } finally { reader.releaseLock(); }
 }
 async function clinicController(request: Request, route?: Endpoint): Promise<Response> {
   let user: Staff | undefined; const url = new URL(request.url);
@@ -61,7 +73,7 @@ async function clinicController(request: Request, route?: Endpoint): Promise<Res
     }
     console.error('Clinic request failed:', error instanceof Error ? error.message : 'Unknown error');
     return responseOf(result({ error: 'The request could not be completed. Refresh the page and try again.' }, 500));
-  } finally { await finishUnusedBody(request); }
+  }
 }
 
 const controller = (endpoint?: Endpoint) => (request: Request) => clinicController(request, endpoint);

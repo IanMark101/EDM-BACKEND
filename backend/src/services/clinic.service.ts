@@ -8,6 +8,9 @@ import { cleanClinical, cleanMeasurements, LAB_LAYOUTS } from '../../../shared/c
 import { managedInvoicesService, pricedImportItems } from './billing.service';
 import { result } from '../http/result';
 import type { ServiceContext } from '../http/context';
+// Coordinate identity edits, new visits and doctor availability.
+const patientSchedulingLock = { lock: 20261108 };
+const openVisitStatuses = oneOf('status', ['waiting', 'draft']);
 function requiredRow<T>(row: T | undefined): T { if (!row)
     throw new AppError('This record could not be found.', 404); return row; }
 function evidence(value: unknown) { const reason = cleanText(value, 'Reason or evidence', 1000); if (reason.length < 12)
@@ -27,7 +30,12 @@ async function syncLabReview(report: any, visit: any, user: Staff, store: Clinic
         if (open.length)
             await store.update("qualityReviews", { state: 'resolved', resolvedAt: now(), resolvedBy: user.name, resolution: 'Required laboratory details checked.', evidence: 'Patient, visit, result, unit and collection time were checked by laboratory staff.' }, allOf(match("recordId", report.id), match("state", 'open')));
     }
-    else if (!open.length) {
+    else if (open.length) {
+        const detail = problems.join(' ');
+        if (open.some(review => review.detail !== detail))
+            await store.update("qualityReviews", { detail }, allOf(match("recordId", report.id), match("state", 'open')));
+    }
+    else {
         const issueId = newId('Q');
         const notices = await notificationRows(user, { key: `quality:${issueId}`, roles: ['reviewer', 'laboratory'], kind: 'due', body: 'saved a report that needs details:', subject: report.id, patientId: report.patientId, entityId: issueId, href: `/clinic/review?open=${issueId}` }, store);
         // Laboratory recipients open the report itself, rather than the reviewer's screen.
@@ -43,6 +51,8 @@ async function materializeImport(imported: any, patientId: string, visitId: stri
         throw new AppError('The selected visit belongs to another patient.', 422);
     const id = `${imported.source === 'laboratory' ? 'L' : 'B'}-IMP-${imported.externalId}`;
     if ('testName' in p) {
+        if (visit.status === 'waiting' || visit.status === 'cancelled')
+            throw new AppError('Choose a started or completed consultation for this laboratory record.', 422);
         const report = { id, patientId, visitId, testName: cleanText(p.testName, 'Test name', 120), value: cleanText(p.value, 'Result', 3000, false), unit: cleanText(p.unit, 'Unit', 80, false), collectedAt: cleanText(p.collectedAt, 'Collection time', 40, false), status: 'draft', requestedBy: visit.doctorId, sourceRef: imported.externalId, updatedAt: now() };
         await store.batch([store.insert("labReports", report), store.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), store.insert("activityHistory", auditRow(user, 'Received laboratory record', 'import', imported.externalId, 'Source reference retained. Report saved as a draft for laboratory review.', patientId))]);
         await syncLabReview(report, visit, user, store);
@@ -58,24 +68,34 @@ async function materializeImport(imported: any, patientId: string, visitId: stri
     }
 }
 export async function loginService(context: ServiceContext) {
-    let { request, user, id, action, input, url } = context;
-    
+    const { request, input } = context;
     const username = cleanText(input.username, 'Username', 60).toLowerCase();
     const password = cleanText(input.password, 'Password', 200);
-    const account = (await repository.find("staffAccounts", match("username", username)))[0];
-    const passwordHash = await hashPassword(password, account?.salt || 'unavailable-account-salt');
-    if (!account || !account.active || account.lockedUntil && Date.parse(account.lockedUntil) > Date.now() || !constantEqual(passwordHash, account.passwordHash)) {
-        if (account && (!account.lockedUntil || Date.parse(account.lockedUntil) <= Date.now())) {
-            const attempts = account.lockedUntil ? 1 : account.failedAttempts + 1;
-            await repository.update("staffAccounts", { failedAttempts: attempts, lockedUntil: attempts >= 5 ? new Date(Date.now() + 15 * 60000).toISOString() : null }, match("id", account.id));
-            await audit(publicStaff(account), 'Sign-in unsuccessful', 'session', account.id, 'Credentials were not accepted. Repeated failed attempts temporarily lock the account.');
-        }
-        throw new AppError('Sign-in was not successful. Check your details, or wait 15 minutes if the account is temporarily locked.', 401);
-    }
-    user = publicStaff(account);
+    const initial = (await repository.find("staffAccounts", match("username", username)))[0];
+    const passwordHash = await hashPassword(password, initial?.salt || 'unavailable-account-salt');
     const token = randomToken();
-    const at = now();
-    await repository.batch([repository.update("staffAccounts", { failedAttempts: 0, lockedUntil: null }, match("id", user.id)), repository.insert("staffSessions", { tokenHash: await digest(token), userId: user.id, createdAt: at, lastSeen: at, expiresAt: new Date(Date.now() + SESSION_MS).toISOString() }), repository.insert("activityHistory", auditRow(user, 'Signed in', 'session', user.id, 'Individual staff account authenticated.'))]);
+    const user = initial && await repository.transaction(async store => {
+        const account = (await store.find("staffAccounts", match("id", initial.id)))[0];
+        if (!account?.active || account.salt !== initial.salt || account.lockedUntil && Date.parse(account.lockedUntil) > Date.now()) return null;
+        const staff = publicStaff(account);
+        const valid = constantEqual(passwordHash, account.passwordHash);
+        const attempts = valid ? 0 : account.lockedUntil ? 1 : account.failedAttempts + 1;
+        // A password reset or access edit may have happened since the read.
+        const current = allOf(match("id", account.id), match("salt", account.salt), match("role", account.role), match("active", true));
+        const updated = await store.update("staffAccounts", { failedAttempts: attempts, lockedUntil: attempts >= 5 ? new Date(Date.now() + 15 * 60000).toISOString() : null }, current);
+        if (!updated.meta.changes) return null;
+        if (!valid) {
+            await store.insert("activityHistory", auditRow(staff, 'Sign-in unsuccessful', 'session', staff.id, 'Credentials were not accepted. Repeated failed attempts temporarily lock the account.'));
+            return null;
+        }
+        const at = now();
+        await store.batch([
+            store.insert("staffSessions", { tokenHash: await digest(token), userId: staff.id, createdAt: at, lastSeen: at, expiresAt: new Date(Date.now() + SESSION_MS).toISOString() }),
+            store.insert("activityHistory", auditRow(staff, 'Signed in', 'session', staff.id, 'Individual staff account authenticated.')),
+        ]);
+        return staff;
+    }, { lock: `staff-login:${username}` });
+    if (!user) throw new AppError('Sign-in was not successful. Check your details, or wait 15 minutes if the account is temporarily locked.', 401);
     return result({ user }, 200, { 'Set-Cookie': sessionCookie(token, request) });
 }
 export async function logoutService(context: ServiceContext) {
@@ -156,61 +176,84 @@ export async function checkInsService(context: ServiceContext) {
         await updateWithHistory("visits", visit, input.version, { status: 'cancelled' }, auditRow(user, 'Cancelled check-in', 'visit', id, reason, visit.patientId), notices);
         return result({ id });
     }
-    const patient = requiredRow((await repository.find("patients", match("id", input.patientId)))[0]);
     const date = dateOnly(input.date, 'Visit date');
-    const doctor = (await repository.find("staffAccounts", match("id", patient.doctorId!)))[0];
-    if (!doctor?.active || doctor.role !== 'doctor')
-        throw new AppError('Assign an active doctor in the patient details before check-in.', 422);
-    const active = (await repository.find("visits", match("patientId", patient.id))).find(v => v.status === 'waiting' || v.date === date && v.status === 'draft');
-    if (active)
-        return result({ id: active.id, alreadyWaiting: true });
-    const visitId = newId('V');
-    const at = now();
-    const notices = await notificationRows(user, { key: `checkin:${visitId}`, staffIds: [doctor.id], kind: 'request', body: 'checked in', subject: patient.name, patientId: patient.id, entityId: visitId, href: `/clinic/visits?open=${visitId}` });
-    await repository.batch([
-        repository.insert("visits", { id: visitId, patientId: patient.id, doctorId: doctor.id, date, reason: '', clinical: { structured: true, allergyStatus: 'unknown' }, status: 'waiting', updatedAt: at }),
-        repository.insert("visitWorkflow", { visitId, checkedInAt: at, queueKey: patient.id }),
-        repository.insert("activityHistory", auditRow(user, 'Checked in patient', 'visit', visitId, 'Patient identity confirmed and waiting visit assigned to the responsible doctor.', patient.id)),
-        ...notificationInsert(notices),
-    ]);
-    return result({ id: visitId }, 201);
+    return repository.transaction(async store => {
+        const patient = requiredRow((await store.find("patients", match("id", input.patientId)))[0]);
+        const [active] = await store.find("visits", allOf(match("patientId", patient.id), openVisitStatuses), { orderBy: "date", limit: 1 });
+        if (active) return result({ id: active.id, alreadyWaiting: true });
+        const doctor = (await store.find("staffAccounts", match("id", patient.doctorId!)))[0];
+        if (!doctor?.active || doctor.role !== 'doctor')
+            throw new AppError('Assign an active doctor in the patient details before check-in.', 422);
+        const visitId = newId('V');
+        const at = now();
+        const notices = await notificationRows(user, { key: `checkin:${visitId}`, staffIds: [doctor.id], kind: 'request', body: 'checked in', subject: patient.name, patientId: patient.id, entityId: visitId, href: `/clinic/visits?open=${visitId}` }, store);
+        await store.batch([
+            store.insert("visits", { id: visitId, patientId: patient.id, doctorId: doctor.id, date, reason: '', clinical: { structured: true, allergyStatus: 'unknown' }, status: 'waiting', updatedAt: at }),
+            store.insert("visitWorkflow", { visitId, checkedInAt: at, queueKey: patient.id }),
+            store.insert("activityHistory", auditRow(user, 'Checked in patient', 'visit', visitId, 'Patient identity confirmed and waiting visit assigned to the responsible doctor.', patient.id)),
+            ...notificationInsert(notices),
+        ]);
+        return result({ id: visitId }, 201);
+    }, patientSchedulingLock);
 }
 export async function patientsService(context: ServiceContext) {
     let { request, user, id, action, input, url } = context;
     assertRole(user, id ? ['registration', 'reviewer'] : ['registration']);
     
     const fields = validatePatient(input);
-    const all = await repository.find("patients", undefined);
-    const possible = all.filter(p => p.id !== id && p.dob === fields.dob && identityKey(p.name) === identityKey(fields.name));
-    if (possible.length && !(input.confirmDifferentPerson === true && typeof input.reason === 'string' && input.reason.trim().length >= 12))
-        throw new AppError(`Possible existing patient: ${possible.map(p => `${p.name} (${p.id})`).join(', ')}. Check the record before creating another. If this is a different person, confirm that and record the evidence.`, 409);
     const doctorId = cleanText(input.doctorId, 'Assigned doctor', 80);
-    const doctor = (await repository.find("staffAccounts", match("id", doctorId)))[0];
-    if (!doctor?.active || doctor.role !== 'doctor')
-        throw new AppError('Choose an active doctor.', 422);
-    if (id) {
-        const old = requiredRow(all.find(p => p.id === id));
-        const reason = evidence(input.reason);
-        await updateWithHistory("patients", old, input.version, { ...fields, doctorId }, auditRow(user, 'Corrected patient details', 'patient', id, JSON.stringify({ previous: { name: old.name, dob: old.dob, phone: old.phone, doctorId: old.doctorId }, corrected: { ...fields, doctorId }, reason }), id));
-        return result({ id });
-    }
-    const patientId = newId('P');
-    await repository.batch([repository.insert("patients", { id: patientId, ...fields, doctorId, updatedAt: now() }), repository.insert("activityHistory", auditRow(user, 'Registered patient', 'patient', patientId, input.reason ? `Different-person evidence: ${evidence(input.reason)}` : 'Identity fields checked and permanent patient number assigned.', patientId))]);
-    return result({ id: patientId }, 201);
+    return repository.transaction(async store => {
+        const old = id ? requiredRow((await store.find("patients", match("id", id)))[0]) : undefined;
+        const identity = identityKey(fields.name);
+        const sameBirthDate = await store.find("patients", match("dob", fields.dob));
+        const possible = sameBirthDate.filter(p => p.id !== id && identityKey(p.name) === identity);
+        if (possible.length && !(input.confirmDifferentPerson === true && typeof input.reason === 'string' && input.reason.trim().length >= 12))
+            throw new AppError(`Possible existing patient: ${possible.map(p => `${p.name} (${p.id})`).join(', ')}. Check the record before creating another. If this is a different person, confirm that and record the evidence.`, 409);
+        const doctor = (await store.find("staffAccounts", match("id", doctorId)))[0];
+        if (!doctor?.active || doctor.role !== 'doctor')
+            throw new AppError('Choose an active doctor.', 422);
+        if (old) {
+            const reason = evidence(input.reason);
+            if (old.doctorId !== doctorId) {
+                const open = await store.find("visits", allOf(match("patientId", id), openVisitStatuses));
+                const owners = open.length ? await store.find("staffAccounts", oneOf("id", [...new Set(open.map(visit => visit.doctorId))])) : [];
+                const activeOwners = new Set(owners.filter(owner => owner.active && owner.role === 'doctor').map(owner => owner.id));
+                const canRestoreAssignment = open.some(visit => visit.doctorId === doctorId) && !open.some(visit => visit.doctorId === old.doctorId);
+                if (!canRestoreAssignment && open.some(visit => visit.doctorId !== doctorId && activeOwners.has(visit.doctorId)))
+                    throw new AppError('This patient has an open visit. Cancel a waiting check-in or have the responsible doctor finish the consultation before changing doctors.', 409);
+                // Managers can revoke access immediately. Preserve draft content and record the handoff.
+                for (const visit of open.filter(visit => !activeOwners.has(visit.doctorId))) {
+                    const notices = await notificationRows(user, { key: `visit-transfer:${visit.id}:${visit.version}`, staffIds: [doctorId], kind: 'edit', body: 'assigned an open visit for', subject: fields.name, patientId: id, entityId: visit.id, href: `/clinic/visits?open=${visit.id}` }, store);
+                    await updateWithHistory("visits", visit, visit.version, { doctorId }, auditRow(user, 'Transferred open visit', 'visit', visit.id, `Previous doctor: ${visit.doctorId}. New doctor: ${doctorId}. Reason: ${reason}`, id), notices, store);
+                }
+            }
+            await updateWithHistory("patients", old, input.version, { ...fields, doctorId }, auditRow(user, 'Corrected patient details', 'patient', id, JSON.stringify({ previous: { name: old.name, dob: old.dob, phone: old.phone, doctorId: old.doctorId }, corrected: { ...fields, doctorId }, reason }), id), [], store);
+            return result({ id });
+        }
+        const patientId = newId('P');
+        await store.batch([store.insert("patients", { id: patientId, ...fields, doctorId, updatedAt: now() }), store.insert("activityHistory", auditRow(user, 'Registered patient', 'patient', patientId, input.reason ? `Different-person evidence: ${evidence(input.reason)}` : 'Identity fields checked and permanent patient number assigned.', patientId))]);
+        return result({ id: patientId }, 201);
+    }, patientSchedulingLock);
 }
 export async function visitsService(context: ServiceContext) {
     let { request, user, id, action, input, url } = context;
     assertRole(user, ['doctor']);
     
     if (!id) {
-        const { patient } = await permittedPatient(user, cleanText(input.patientId, 'Patient number', 80));
+        const patientId = cleanText(input.patientId, 'Patient number', 80);
         const visitId = newId('V');
-        const row = { id: visitId, patientId: patient.id, doctorId: user.id, date: dateOnly(input.date, 'Visit date'), reason: cleanText(input.reason, 'Reason for visit', 200), notes: cleanText(input.notes, 'Consultation notes', 5000, false), clinical: cleanClinical(input.clinical || { allergyStatus: 'unknown' }), updatedAt: now() };
-        const ongoing = (await repository.find("visits", match("patientId", patient.id))).find(v => v.status === 'waiting' || v.date === row.date && v.status === 'draft');
-        if (ongoing)
-            throw new AppError(`Visit ${ongoing.id} is already open. Continue that visit instead of creating another consultation.`, 409);
-        await repository.batch([repository.insert("visits", row), repository.insert("activityHistory", auditRow(user, 'Opened consultation', 'visit', visitId, 'A separate visit number was assigned to the patient.', patient.id))]);
-        return result({ id: visitId }, 201);
+        const row = { id: visitId, patientId, doctorId: user.id, date: dateOnly(input.date, 'Visit date'), reason: cleanText(input.reason, 'Reason for visit', 200), notes: cleanText(input.notes, 'Consultation notes', 5000, false), clinical: cleanClinical(input.clinical || { allergyStatus: 'unknown' }), updatedAt: now() };
+        return repository.transaction(async store => {
+            const [patient] = await store.find("patients", match("id", patientId));
+            const [doctor] = await store.find("staffAccounts", match("id", user.id));
+            if (patient?.doctorId !== user.id || !doctor?.active || doctor.role !== 'doctor')
+                throw new AppError('This patient is not available to your account.', 403);
+            const [ongoing] = await store.find("visits", allOf(match("patientId", patient.id), openVisitStatuses), { limit: 1 });
+            if (ongoing)
+                throw new AppError(`Visit ${ongoing.id} is already open. Continue that visit instead of creating another consultation.`, 409);
+            await store.batch([store.insert("visits", row), store.insert("activityHistory", auditRow(user, 'Opened consultation', 'visit', visitId, 'A separate visit number was assigned to the patient.', patient.id))]);
+            return result({ id: visitId }, 201);
+        }, patientSchedulingLock);
     }
     const old = requiredRow((await repository.find("visits", match("id", id)))[0]);
     await permittedPatient(user, old.patientId);
@@ -300,8 +343,10 @@ export async function labsService(context: ServiceContext) {
         doctorReview: mode === 'save' ? old.doctorReview : {}, history, status: mode === 'save' ? 'draft' : 'approved', approvedBy: mode === 'save' ? null : user.id, approvedAt: mode === 'save' ? null : now() };
     const patient = requiredRow((await repository.find("patients", match("id", old.patientId)))[0]);
     const notices = mode === 'save' ? [] : await notificationRows(user, { key: `lab-approved:${id}:${old.version}`, staffIds: [patient.doctorId!], kind: urgency === 'urgent' ? 'due' : mode === 'correct' ? 'edit' : 'file', body: urgency === 'urgent' ? 'sent an urgent approved report for' : mode === 'correct' ? 'corrected an approved report for' : 'approved a laboratory report for', subject: patient.name, patientId: patient.id, entityId: id, href: `/clinic/laboratory?open=${id}` });
-    await updateWithHistory("labReports", old, input.version, patch, auditRow(user, mode === 'correct' ? 'Approved report correction' : mode === 'approve' ? 'Approved laboratory report' : 'Saved laboratory draft', 'lab', id, reason || (problems.length ? `Required details still missing: ${problems.join(' ')}` : 'Required details checked; laboratory staff remain responsible for checking the report content.'), old.patientId), notices);
-    await syncLabReview({ ...report, ...patch }, visit, user);
+    await repository.transaction(async store => {
+        await updateWithHistory("labReports", old, input.version, patch, auditRow(user, mode === 'correct' ? 'Approved report correction' : mode === 'approve' ? 'Approved laboratory report' : 'Saved laboratory draft', 'lab', id, reason || (problems.length ? `Required details still missing: ${problems.join(' ')}` : 'Required details checked; laboratory staff remain responsible for checking the report content.'), old.patientId), notices, store);
+        await syncLabReview({ ...report, ...patch }, visit, user, store);
+    });
     return result({ id });
 }
 export async function invoicesService(context: ServiceContext) {
@@ -451,15 +496,17 @@ export async function staffService(context: ServiceContext) {
     }
     if (id === user.id)
         throw new AppError('Your own role and access cannot be changed from this session.', 422);
-    const old = requiredRow((await repository.find("staffAccounts", match("id", id)))[0]);
     if (!ROLES.includes(input.role) || typeof input.active !== 'boolean')
         throw new AppError('Choose a valid role and account state.', 422);
     const reason = evidence(input.reason);
-    const notices = await notificationRows(user, { key: `staff-access:${id}:${crypto.randomUUID()}`, roles: ['manager'], staffIds: [id], kind: 'edit', body: 'updated staff access for', subject: old.name, entityId: id, href: '/clinic/access' });
-    notices.forEach(n => { if (n.recipientId === id)
-        n.recipientRole = input.role;
-    else
-        n.href = '/clinic/staff'; });
-    await repository.batch([repository.update("staffAccounts", { role: input.role, active: input.active }, match("id", id)), repository.remove("staffSessions", match("userId", id)), repository.insert("activityHistory", auditRow(user, 'Changed staff permissions', 'staff', id, `${old.name}: ${old.role} → ${input.role}; access ${input.active ? 'enabled' : 'disabled'}. Existing sessions ended. Reason: ${reason}`)), ...notificationInsert(notices)]);
-    return result({ id });
+    return repository.transaction(async store => {
+        const old = requiredRow((await store.find("staffAccounts", match("id", id)))[0]);
+        const notices = await notificationRows(user, { key: `staff-access:${id}:${crypto.randomUUID()}`, roles: ['manager'], staffIds: [id], kind: 'edit', body: 'updated staff access for', subject: old.name, entityId: id, href: '/clinic/access' }, store);
+        notices.forEach(n => {
+            if (n.recipientId === id) n.recipientRole = input.role;
+            else n.href = '/clinic/staff';
+        });
+        await store.batch([store.update("staffAccounts", { role: input.role, active: input.active }, match("id", id)), store.remove("staffSessions", match("userId", id)), store.insert("activityHistory", auditRow(user, 'Changed staff permissions', 'staff', id, `${old.name}: ${old.role} → ${input.role}; access ${input.active ? 'enabled' : 'disabled'}. Existing sessions ended. Reason: ${reason}`)), ...notificationInsert(notices)]);
+        return result({ id });
+    }, patientSchedulingLock);
 }

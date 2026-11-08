@@ -32,6 +32,8 @@ app.use('/api', async (req, res) => {
     const response = await routeRequest(request);
     res.status(response.status);
     response.headers.forEach((value, name) => { if (name !== 'set-cookie') res.setHeader(name, value); });
+    // An early rejection can return before the caller has finished uploading.
+    if (!req.complete) res.setHeader('Connection', 'close');
     const cookies = response.headers.getSetCookie(); if (cookies.length) res.setHeader('set-cookie', cookies);
     res.end(Buffer.from(await response.arrayBuffer()));
   } catch (error) {

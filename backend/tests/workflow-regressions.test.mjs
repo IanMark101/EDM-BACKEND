@@ -10,7 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 // and startup seeding. Tests cannot connect to or seed an installed clinic.
 const bundle = await build({
   stdin: { contents: `
-    export { importsService, reviewsService, invoicesService } from './backend/src/services/clinic.service.ts';
+    export { importsService, reviewsService, invoicesService, labsService, checkInsService } from './backend/src/services/clinic.service.ts';
     export { refreshWarehouse, visibleData } from './backend/src/services/server.ts';
     export { servicePricesService } from './backend/src/services/pricing.service.ts';
     export { historyService } from './backend/src/services/history.service.ts';
@@ -39,7 +39,7 @@ const bundle = await build({
     build.onLoad({ filter: /.*/, namespace: 'source' }, args => ({ contents: readFileSync(args.path, 'utf8'), loader: extname(args.path) === '.ts' ? 'ts' : 'js' }));
   } }],
 });
-const { importsService, reviewsService, invoicesService, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
+const { importsService, reviewsService, invoicesService, labsService, checkInsService, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
 const modelNames = ['staffAccount', 'staffSession', 'patient', 'visit', 'labReport', 'invoice', 'qualityReview', 'sourceImport', 'warehouseFact', 'warehouseRun', 'activityHistory', 'appSetting', 'visitWorkflow', 'staffNotification', 'patientPortalAccount', 'patientPortalSession'];
 function matches(row, where = {}) {
@@ -124,6 +124,41 @@ const bill = (externalId, extra = {}) => sourceRow(externalId, { date: '2026-01-
 const lab = (externalId, extra = {}) => sourceRow(externalId, { testName: 'Glucose', value: '92', unit: 'mg/dL', collectedAt: '2026-01-02T09:00:00+08:00', ...extra });
 const receive = (source, records) => importsService({ user: { id: 'U-STAFF', name: 'Staff', role: source }, input: { source, records } });
 const decide = (id, decision = 'link') => reviewsService({ id, user: { id: 'U-REVIEW', name: 'Reviewer', role: 'reviewer' }, input: { decision, patientId: 'P-1', visitId: 'V-1', confirmedDob: '2000-01-01', evidence: 'Verified original identity documents.' } });
+
+test('a registration user receives the version needed to cancel a waiting visit', async () => {
+  const user = { id: 'U-REG', name: 'Reception', role: 'registration' };
+  Object.assign(db.tables.visit[0], { status: 'waiting', version: 1 });
+  db.tables.visitWorkflow.push({ visitId: 'V-1', queueKey: 'P-1' });
+  const [visit] = (await visibleData(user)).visits;
+  await checkInsService({ user, id: visit.id, input: { version: visit.version, reason: 'Patient requested a new doctor.' } });
+  assert.equal(db.tables.visit[0].status, 'cancelled');
+  assert.equal(db.tables.visitWorkflow[0].queueKey, null);
+});
+
+test('ordinary laboratory saves roll back when the quality task cannot be recorded', async () => {
+  await receive('laboratory', [lab('L-ATOMIC')]);
+  const [original] = db.tables.labReport;
+  const user = { id: 'U-LAB', name: 'Laboratory', role: 'laboratory' };
+  const input = { action: 'save', version: original.version, value: '92', unit: 'mg/dL', collectedAt: '', urgency: 'routine', contact: {} };
+  const historyCount = db.tables.activityHistory.length;
+  db.failure = (name, action) => name === 'qualityReview' && action === 'createMany';
+  await assert.rejects(labsService({ user, id: original.id, input }), /Injected qualityReview/);
+  assert.deepEqual(db.tables.labReport[0], original);
+  assert.equal(db.tables.activityHistory.length, historyCount);
+  assert.equal(db.tables.qualityReview.length, 0);
+  db.failure = null;
+  await labsService({ user, id: original.id, input });
+  assert.equal(db.tables.labReport[0].version, original.version + 1);
+  assert.match(db.tables.qualityReview[0].detail, /collection/);
+});
+
+test('cancelled visits cannot receive laboratory imports or contribute laboratory facts', async () => {
+  db.tables.visit[0].status = 'cancelled';
+  await assert.rejects(receive('laboratory', [lab('L-CANCELLED')]), /started or completed consultation/);
+  assert.equal(db.tables.sourceImport.length, 0);
+  db.tables.labReport.push({ ...lab('L-CANCELLED'), id: 'L-LEGACY', sourceRef: 'L-CANCELLED', status: 'approved' });
+  assert.equal((await refreshWarehouse({ id: 'U-REVIEW', name: 'Reviewer', role: 'reviewer' })).count, 0);
+});
 
 test('unsigned bill leaves no staged row and succeeds after signing', async () => {
   db.tables.visit[0].status = 'draft';
