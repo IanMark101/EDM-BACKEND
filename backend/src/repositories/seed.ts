@@ -76,7 +76,6 @@ async function seed(allowTestData: boolean) {
     return { id: `B-${String(i + 1).padStart(4, '0')}`, patientId: visit.patientId, visitId: visit.id, date: visit.date, items, total, paid,
       payments: paid ? [{ id: `PAY-SEED-${i}`, amount: paid, method: 'Cash', at: `${visit.date}T05:00:00.000Z`, by: 'Kent Jeced Alcantara', reference: 'Sample payment' }] : [], sourceRef: `BILL-${i + 1}`, updatedAt: at };
   });
-  const held = { externalId: 'LAB-0089', patientId: 'P-0001', patientName: 'Ana R. Reyes', patientDob: '', visitId: 'V-0024', testName: 'Urinalysis', value: 'Sample report recorded', unit: 'Not applicable', collectedAt: '2026-10-29T01:00:00.000Z' };
   const facts = [
     ...visitRows.filter(v => v.status === 'signed').map(v => ({ id: `visit:${v.id}`, source: 'Clinic', sourceId: v.id, kind: 'visit', patientKey: v.patientId, visitId: v.id, date: v.date, service: 'Consultation', total: 0, paid: 0, refreshedAt: at })),
     ...labRows.filter(l => l.status === 'approved').map(l => ({ id: `lab:${l.id}`, source: 'Laboratory', sourceId: l.id, kind: 'lab', patientKey: l.patientId, visitId: l.visitId, date: l.collectedAt.slice(0, 10), service: l.testName, total: 0, paid: 0, refreshedAt: at })),
@@ -90,11 +89,6 @@ async function seed(allowTestData: boolean) {
     ...chunks(visitRows).map(rows => repository.insert("visits", rows, { ignore: true })),
     ...chunks(labRows).map(rows => repository.insert("labReports", rows, { ignore: true })),
     ...chunks(billRows).map(rows => repository.insert("invoices", rows, { ignore: true })),
-    repository.insert("sourceImports", { id: 'import-lab-0089', source: 'laboratory', externalId: 'LAB-0089', payload: held, state: 'held', receivedAt: at }, { ignore: true }),
-    repository.insert("qualityReviews", [
-      { id: 'Q-L0032', kind: 'lab', patientId: 'P-0001', recordId: 'L-0032', title: 'Collection time missing', detail: 'Laboratory report L-0032 needs a sample collection date and time before approval.', ownerRole: 'laboratory', createdAt: at },
-      { id: 'Q-IMPORT0089', kind: 'identity', patientId: 'P-0001', recordId: 'import-lab-0089', title: 'Confirm the patient identity', detail: 'Incoming LAB-0089 has an abbreviated name and no birth date. It has been kept separate.', ownerRole: 'registration', createdAt: at },
-    ], { ignore: true }),
     ...chunks(facts).map(rows => repository.insert("warehouseFacts", rows, { ignore: true })),
     repository.insert("warehouseRuns", { id: 'RUN-SEED', at, userId: 'staff-reviewer', count: facts.length, summary: { Clinic: 16, Laboratory: 6, Billing: 10 } }, { ignore: true }),
     repository.insert("activityHistory", [

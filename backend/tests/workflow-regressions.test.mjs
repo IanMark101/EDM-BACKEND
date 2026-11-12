@@ -135,21 +135,60 @@ test('a registration user receives the version needed to cancel a waiting visit'
   assert.equal(db.tables.visitWorkflow[0].queueKey, null);
 });
 
-test('ordinary laboratory saves roll back when the quality task cannot be recorded', async () => {
-  await receive('laboratory', [lab('L-ATOMIC')]);
-  const [original] = db.tables.labReport;
+test('incomplete drafts stay with Laboratory and approval still requires all details', async () => {
+  const doctor = { id: 'D-1', name: 'Doctor', role: 'doctor', active: true };
+  db.tables.staffAccount.push(doctor);
+  const requested = await labsService({ user: doctor, input: { patientId: 'P-1', visitId: 'V-1', testName: 'Blood glucose' } });
+  const id = requested.body.id;
   const user = { id: 'U-LAB', name: 'Laboratory', role: 'laboratory' };
+  const reviewer = { id: 'U-REVIEW', name: 'Reviewer', role: 'reviewer' };
+  const original = db.tables.labReport.find(report => report.id === id);
   const input = { action: 'save', version: original.version, value: '92', unit: 'mg/dL', collectedAt: '', urgency: 'routine', contact: {} };
-  const historyCount = db.tables.activityHistory.length;
-  db.failure = (name, action) => name === 'qualityReview' && action === 'createMany';
-  await assert.rejects(labsService({ user, id: original.id, input }), /Injected qualityReview/);
-  assert.deepEqual(db.tables.labReport[0], original);
-  assert.equal(db.tables.activityHistory.length, historyCount);
+  await labsService({ user, id, input });
+  const draft = db.tables.labReport.find(report => report.id === id);
+  assert.equal(draft.status, 'draft');
   assert.equal(db.tables.qualityReview.length, 0);
-  db.failure = null;
-  await labsService({ user, id: original.id, input });
-  assert.equal(db.tables.labReport[0].version, original.version + 1);
-  assert.match(db.tables.qualityReview[0].detail, /collection/);
+  assert.equal(db.tables.staffNotification.some(notice => notice.recipientRole === 'reviewer'), false);
+  assert.equal((await visibleData(user)).labs.find(report => report.id === id).status, 'draft');
+  assert.deepEqual((await visibleData(reviewer)).reviews, []);
+  assert.equal(db.tables.activityHistory.at(-1).action, 'Saved laboratory draft');
+
+  const approval = { ...input, version: draft.version, action: 'approve', reviewed: true };
+  await assert.rejects(labsService({ user, id, input: approval }), /collection date and time/);
+  assert.equal(db.tables.labReport.find(report => report.id === id).status, 'draft');
+  await labsService({ user, id, input: { ...approval, collectedAt: '2026-01-02T02:00:00Z' } });
+  assert.equal((await visibleData(doctor)).labs.find(report => report.id === id).status, 'approved');
+  assert.ok(db.tables.staffNotification.some(notice => notice.entityId === id && notice.recipientId === doctor.id));
+});
+
+test('reviewer sees approved report problems and identity checks without legacy draft alerts', async () => {
+  const reviewer = { id: 'U-REVIEW', name: 'Reviewer', role: 'reviewer' };
+  const user = { id: 'U-LAB', name: 'Laboratory', role: 'laboratory' };
+  await receive('laboratory', [lab('LEGACY-DRAFT', { collectedAt: '' }), lab('APPROVED-BAD', { collectedAt: '' })]);
+  const [draft, approved] = db.tables.labReport;
+  approved.status = 'approved';
+  db.tables.qualityReview.push(
+    { id: 'Q-OLD-DRAFT', kind: 'lab', state: 'open', ownerRole: 'laboratory', recordId: draft.id },
+    { id: 'Q-OLD-RESOLVED', kind: 'lab', state: 'resolved', ownerRole: 'laboratory', recordId: approved.id },
+    { id: 'Q-IDENTITY', kind: 'identity', state: 'open', ownerRole: 'registration', recordId: 'IMP-1' },
+  );
+  db.tables.staffNotification.push(
+    { id: 'N-DRAFT', recipientId: reviewer.id, recipientRole: 'reviewer', eventKey: 'quality:Q-OLD-DRAFT', entityId: 'Q-OLD-DRAFT' },
+    { id: 'N-OLD-BACKLOG', recipientId: reviewer.id, recipientRole: 'reviewer', eventKey: 'existing-work:reviewer:Q-OLD-DRAFT', entityId: 'Q-OLD-DRAFT' },
+  );
+  const workspace = await visibleData(reviewer);
+  assert.equal(workspace.quality.identityQuestions, 1);
+  assert.equal(workspace.quality.invalidApproved, 1);
+  assert.deepEqual(workspace.reviews.filter(review => review.state === 'open').map(review => review.recordId), [approved.id, 'IMP-1']);
+  assert.ok(workspace.reviews.some(review => review.id === 'Q-OLD-RESOLVED'));
+  assert.ok(workspace.notifications.some(notice => notice.entityId === 'Q-IDENTITY'));
+  assert.equal(workspace.notifications.some(notice => notice.entityId === 'Q-OLD-DRAFT'), false);
+  assert.equal(workspace.labs.length, 0);
+
+  await labsService({ user, id: draft.id, input: {
+    action: 'approve', version: draft.version, value: '92', unit: 'mg/dL', collectedAt: '2026-01-02T02:00:00Z', urgency: 'routine', contact: {}, reviewed: true,
+  } });
+  assert.equal(db.tables.qualityReview.find(review => review.id === 'Q-OLD-DRAFT').state, 'resolved');
 });
 
 test('cancelled visits cannot receive laboratory imports or contribute laboratory facts', async () => {
@@ -221,9 +260,9 @@ test('failed review resolution rolls back materialized report and notifications'
   await assert.rejects(decide(db.tables.qualityReview[0].id), /Injected/);
   assert.deepEqual(db.tables, before);
 });
-test('lab quality-task failure rolls back the source and draft report', async () => {
-  db.failure = (name, action) => name === 'qualityReview' && action === 'createMany';
-  await assert.rejects(receive('laboratory', [lab('L-1', { unit: '' })]), /Injected/);
+test('lab import audit failure rolls back the source and draft report', async () => {
+  db.failure = (name, action) => name === 'activityHistory' && action === 'createMany';
+  await assert.rejects(receive('laboratory', [lab('L-1')]), /Injected/);
   assert.equal(db.tables.labReport.length, 0); assert.equal(db.tables.sourceImport.length, 0);
 });
 test('normalizes identity whitespace and collection offsets before persisting', async () => {
@@ -238,12 +277,12 @@ test('rejects offset-free and impossible timestamps without writes, allowing yea
   assert.equal(db.tables.labReport[0].collectedAt, '2025-12-31T17:00:00.000Z');
 });
 test('notifications publish only after the enclosing transaction commits', async () => {
-  const observed = []; const stop = onNotificationChanges(() => observed.push({ active: db.active, reports: db.tables.labReport.length }));
+  const observed = []; const stop = onNotificationChanges(() => observed.push({ active: db.active, imports: db.tables.sourceImport.length }));
   try {
-    await receive('laboratory', [lab('L-1', { unit: '' })]);
-    assert.deepEqual(observed, [{ active: false, reports: 1 }]);
+    await receive('laboratory', [lab('L-1', { patientName: 'Uncertain Name' })]);
+    assert.deepEqual(observed, [{ active: false, imports: 1 }]);
     db.failure = (name, action) => name === 'qualityReview' && action === 'createMany';
-    await assert.rejects(receive('laboratory', [lab('L-2', { unit: '' })])); assert.equal(observed.length, 1);
+    await assert.rejects(receive('laboratory', [lab('L-2', { patientName: 'Uncertain Name' })])); assert.equal(observed.length, 1);
   } finally { stop(); }
 });
 test('import role checks happen before opening a transaction', async () => {
@@ -355,6 +394,116 @@ test('laboratory charges require an approved complete report from the same patie
   }
   await prepareBill({ items });
   assert.equal(db.tables.invoice[0].total, 26001); assert.equal(db.tables.invoice[0].items[1].source.originalRef, 'LAB-ORIGINAL');
+});
+
+test('doctors can order catalog tests without a fee, but unavailable and unknown tests are rejected', async () => {
+  await savePrice({ name: 'Blood glucose' });
+  await savePrice({ name: 'Cholesterol', active: false });
+  const doctor = { id: 'D-1', name: 'Doctor', role: 'doctor' };
+  const workspace = await visibleData(doctor);
+  assert.equal(workspace.labTestNames.length, 7);
+  for (const name of ['Blood glucose', 'Complete blood count', 'Urinalysis', 'Lipid panel', 'Hemoglobin A1c', 'Creatinine', 'Blood urea nitrogen'])
+    assert.ok(workspace.labTestNames.includes(name), name);
+  assert.equal(workspace.priceList, undefined);
+
+  const request = testName => labsService({ user: doctor, input: { patientId: 'P-1', visitId: 'V-1', testName } });
+  await assert.rejects(request('Cholesterol'), /Choose an available laboratory test/);
+  await assert.rejects(request('Blood glucose test'), /Choose an available laboratory test/);
+  assert.equal(db.tables.labReport.length, 0);
+
+  await request('Blood glucose');
+  assert.equal(db.tables.labReport[0].testName, 'Blood glucose');
+  await request('Complete blood count');
+  assert.equal(db.tables.labReport[1].testName, 'Complete blood count');
+  const labWorkspace = await visibleData({ id: 'U-LAB', role: 'laboratory' });
+  assert.equal(labWorkspace.labs[1].visitId, 'V-1');
+  assert.equal(labWorkspace.labs[1].testName, 'Complete blood count');
+  assert.ok(db.tables.staffNotification.some(notification => notification.entityId === db.tables.labReport[1].id));
+});
+
+test('fresh installations have several orderable tests without inventing prices', async () => {
+  db.tables.appSetting = [];
+  const workspace = await visibleData({ id: 'D-1', name: 'Doctor', role: 'doctor' });
+  assert.equal(workspace.labTestNames.length, 7);
+  assert.deepEqual(pricesNow().entries, []);
+});
+
+test('legacy test aliases appear once and previously disabled clinic prices stay unavailable', async () => {
+  const setting = db.tables.appSetting.find(setting => setting.key === 'service-prices-v1');
+  const prices = pricesNow();
+  const lab = (name, active) => ({ id: name, kind: 'laboratory', name, amount: 25000, active });
+  prices.entries.push(lab('Blood glucose test', true), lab('Blood glucose', true), lab('Urinalysis', false));
+  setting.value = JSON.stringify(prices);
+  const workspace = await visibleData({ id: 'D-1', name: 'Doctor', role: 'doctor' });
+  assert.equal(workspace.labTestNames.filter(name => /^Blood glucose/.test(name)).length, 1);
+  assert.ok(!workspace.labTestNames.includes('Urinalysis'));
+});
+
+test('only managers change test availability and fee changes preserve their ordering decisions', async () => {
+  const toggle = (extra = {}, user = manager) => savePrice({ action: 'lab-availability', name: 'Complete blood count', available: false, ...extra }, user);
+  await assert.rejects(toggle({}, cashier), error => error.status === 403);
+  await assert.rejects(toggle({ name: 'Unknown test' }), error => error.status === 422);
+  await assert.rejects(toggle({ available: 'false' }), error => error.status === 422);
+  await toggle();
+  const version = pricesNow().version;
+  await assert.rejects(toggle({ available: true, version: version - 1 }), error => error.status === 409);
+  assert.equal(db.tables.activityHistory[0].action, 'Disabled laboratory test ordering');
+  await savePrice({ name: 'Complete blood count', amount: '350' });
+  let workspace = await visibleData({ id: 'D-1', name: 'Doctor', role: 'doctor' });
+  assert.ok(!workspace.labTestNames.includes('Complete blood count'));
+  await assert.rejects(labsService({ user: { id: 'D-1', role: 'doctor' }, input: { patientId: 'P-1', visitId: 'V-1', testName: 'Complete blood count' } }), error => error.status === 422);
+  await toggle({ available: true });
+  workspace = await visibleData({ id: 'D-1', name: 'Doctor', role: 'doctor' });
+  assert.ok(workspace.labTestNames.includes('Complete blood count'));
+});
+
+test('test availability and its audit record roll back together', async () => {
+  const before = structuredClone(db.tables);
+  db.failure = (name, action) => name === 'activityHistory' && action === 'createMany';
+  await assert.rejects(savePrice({ action: 'lab-availability', name: 'Urinalysis', available: false }), /Injected/);
+  assert.deepEqual(db.tables, before);
+});
+
+test('unpriced catalog tests reach billing with their source and require an approved fee', async () => {
+  approvedLab();
+  db.tables.labReport[0].testName = 'Complete blood count';
+  let workspace = await visibleData(cashier);
+  assert.equal(workspace.billingServices[0].charges[1].price, null);
+  const items = [{ sourceKey: 'visit:V-1' }, { sourceKey: 'lab:L-APPROVED' }];
+  await assert.rejects(prepareBill({ items }), error => error.status === 422);
+  assert.equal(db.tables.invoice.length, 0);
+  await savePrice({ name: 'Complete blood count', amount: '350' });
+  await prepareBill({ items });
+  assert.equal(db.tables.invoice[0].items[1].description, 'Complete blood count');
+  assert.equal(db.tables.invoice[0].items[1].amount, 35000);
+});
+
+test('a legacy Blood glucose test report uses the approved Blood glucose price', async () => {
+  await changeConsultationPrice('500');
+  await savePrice({ name: 'Blood glucose' });
+  approvedLab();
+  db.tables.labReport[0].testName = 'Blood glucose test';
+
+  const workspace = await visibleData(cashier);
+  assert.equal(workspace.billingServices[0].charges[1].price.amount, 25000);
+  await prepareBill({ items: [{ sourceKey: 'visit:V-1' }, { sourceKey: 'lab:L-APPROVED' }] });
+  const invoice = db.tables.invoice[0];
+  assert.equal(invoice.total, 75000);
+  assert.equal(invoice.items[1].source.name, 'Blood glucose test');
+  assert.equal(invoice.items[1].price.name, 'Blood glucose');
+});
+
+test('an explicit blood glucose price remains authoritative, including when disabled', async () => {
+  await savePrice({ name: 'Blood glucose' });
+  const { body: prices } = await savePrice({ name: 'Blood glucose test', amount: '300' });
+  const exact = prices.entries.find(price => price.name === 'Blood glucose test');
+  approvedLab();
+  db.tables.labReport[0].testName = 'Blood glucose test';
+  const quote = () => chargeOffers(db.tables.visit[0], db.tables.labReport, [], pricesNow())[1];
+  assert.equal(quote().price.amount, 30000);
+
+  await savePrice({ id: exact.id, name: exact.name, amount: '300', active: false, reason: 'Temporarily unavailable for billing.' });
+  assert.equal(quote().price, null);
 });
 
 test('missing or disabled prices and outdated quotes block new charges', async () => {
@@ -546,6 +695,18 @@ async function staffCookie(user) {
   db.tables.staffSession.push({ tokenHash, userId: user.id, lastSeen: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString() });
   return `carerecord_session=${token}`;
 }
+
+test('the retired file-import API cannot create records for any staff role', async () => {
+  const previousImports = structuredClone(db.tables.sourceImport);
+  const previousLabs = structuredClone(db.tables.labReport);
+  for (const role of ['laboratory', 'billing', 'reviewer', 'registration', 'doctor', 'manager']) {
+    const cookie = await staffCookie({ id: 'RETIRED-IMPORT-' + role, name: 'Practice ' + role, username: 'practice.' + role, role, active: true });
+    const response = await api('imports', { source: 'laboratory', records: [lab('RETIRED-FILE')] }, cookie);
+    assert.equal(response.status, 404);
+  }
+  assert.deepEqual(db.tables.sourceImport, previousImports);
+  assert.deepEqual(db.tables.labReport, previousLabs);
+});
 
 test('hosted startup creates one manager, and redeploys keep the account and password', async () => {
   for (const name of modelNames) db.tables[name] = [];

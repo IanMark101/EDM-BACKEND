@@ -35,11 +35,11 @@ The `shared/` folder contains the types and rules used by both applications. Kee
 
 On later starts the backend uses the existing manager account. The container uses Neon for persistent storage. Configure backups in Neon or use a separate durable backup setup.
 
-## Import behavior and checks
+## Workflow and reporting checks
 
-Department JSON imports commit the whole file together, including held identity reviews, audit entries and notifications. If a row fails, no changes from that file are saved; correct the cause and resubmit. A previously stranded held source row without an identity-review decision is retried using its stored payload. Imported or reviewed source references remain protected from replacement by a later file.
+The clinic uses linked registration, consultation, laboratory and billing workflows. Department file importing has been removed from the UI and public API. Existing historical records and identity-review decisions are retained; the legacy resolution helpers remain available internally for those records.
 
-Laboratory collection timestamps must use ISO 8601 with `Z` or an explicit offset, such as `2026-01-02T09:00:00+08:00`. They are normalized to UTC. Reporting refreshes read and replace their figures in one serializable transaction, with bounded retries for concurrent changes.
+Laboratory reports require patient/visit links, result details, units and collection times before approval. Reporting refreshes read and replace their figures in one serializable transaction, with bounded retries for concurrent changes. Draft consultations and incomplete or unapproved laboratory reports do not contribute reporting copies.
 
 Run `npm test` for workflow regression tests and `npm run typecheck` for TypeScript checks. Tests use actual services and repositories with an isolated in-memory database substitute; they do not connect to the configured clinic database.
 

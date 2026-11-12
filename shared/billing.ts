@@ -5,7 +5,7 @@ export type ServicePrice = {
   id: string; kind: ServiceKind; name: string; amount: number; active: boolean;
   updatedAt: string; updatedBy: string; updatedById: string;
 };
-export type ServicePriceList = { version: number; entries: ServicePrice[] };
+export type ServicePriceList = { version: number; entries: ServicePrice[]; labTestAvailability?: Record<string, boolean> };
 export type ChargeSource = {
   key: string; kind: ServiceKind; recordId: string; originalRef: string;
   name: string; completedAt: string; completedBy: string;
@@ -17,6 +17,45 @@ export type LinkedCharge = {
   addedAt: string; addedBy: string;
 };
 export const serviceNameKey = (name: string) => name.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+
+const starterLabTests = [
+  'Blood glucose', 'Blood urea nitrogen', 'Complete blood count', 'Creatinine',
+  'Hemoglobin A1c', 'Lipid panel', 'Urinalysis',
+];
+const glucoseAliases = ['blood glucose', 'blood glucose test'];
+
+export function labTestKey(name: string) {
+  const key = serviceNameKey(name);
+  return glucoseAliases.includes(key) ? glucoseAliases[0] : key;
+}
+
+export function labTestCatalog(prices: ServicePriceList) {
+  const tests = new Map(starterLabTests.map(name => [labTestKey(name), { name, price: null as ServicePrice | null }]));
+  for (const price of prices.entries) {
+    if (price.kind !== 'laboratory') continue;
+    const key = labTestKey(price.name);
+    const current = tests.get(key);
+    if (!current?.price || serviceNameKey(price.name) === key) tests.set(key, { name: price.name, price });
+  }
+  return Array.from(tests, ([key, test]) => ({
+    ...test,
+    available: (Object.hasOwn(prices.labTestAvailability ?? {}, key) ? prices.labTestAvailability![key] : undefined)
+      ?? test.price?.active ?? true,
+  })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function priceForService(source: ChargeSource, prices: ServicePriceList) {
+  const name = serviceNameKey(source.name);
+  const entries = prices.entries.filter(price => price.kind === source.kind);
+  const exact = entries.find(price => serviceNameKey(price.name) === name);
+  if (exact) return exact.active ? exact : null;
+
+  // Older lab requests used both spellings. Keep explicit price entries authoritative.
+  if (source.kind !== 'laboratory') return null;
+  if (!glucoseAliases.includes(name)) return null;
+  const alternate = glucoseAliases.find(alias => alias !== name);
+  return entries.find(price => price.active && serviceNameKey(price.name) === alternate) || null;
+}
 
 // Only service identity and completion details cross into billing, never result
 // values, consultation notes, or a doctor's follow-up decision.
@@ -40,6 +79,6 @@ export function chargeOffers(visit: any, labs: any[], staff: any[], prices: Serv
   }
   return sources.map(source => ({
     source, alreadyBilled: billed.has(source.key),
-    price: prices.entries.find(price => price.active && price.kind === source.kind && serviceNameKey(price.name) === serviceNameKey(source.name)) || null,
+    price: priceForService(source, prices),
   }));
 }

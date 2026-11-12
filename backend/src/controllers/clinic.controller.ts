@@ -98,7 +98,6 @@ export const controllers = {
   labs: controller({ service: clinic.labsService }),
   invoices: controller({ service: clinic.invoicesService }),
   reviews: controller({ service: clinic.reviewsService }),
-  imports: controller({ service: clinic.importsService }),
   warehouse: controller({ service: clinic.warehouseService }),
   staff: controller({ service: clinic.staffService }),
   password: controller({ service: operations.passwordService, limit: 20_000 }),

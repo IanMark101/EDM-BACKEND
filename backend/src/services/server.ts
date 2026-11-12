@@ -4,10 +4,9 @@ export { updateWithHistory } from '../repositories/record.repository';
 import { AppError, type Staff, publicStaff, labProblems, summarizeFacts, clinicDay } from '../../../shared/domain';
 import { cookieToken, digest, sessionExpired, roleCanReadPatient } from './security';
 import { ensureSeed } from '../repositories/seed';
-import type { StaffNotification } from './notifications';
 import { ensureNotificationBacklog } from './notification-backlog';
 import { readPriceList } from '../repositories/pricing.repository';
-import { chargeOffers } from '../../../shared/billing';
+import { labTestCatalog, chargeOffers } from '../../../shared/billing';
 export const now = () => new Date().toISOString();
 export const newId = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 export function auditRow(user: { id: string; name: string; role: Staff['role'] | 'patient' }, action: string, entityType: string, entityId: string, detail: string, patientId?: string) {
@@ -57,7 +56,11 @@ export async function loadAll() {
 }
 export async function visibleData(user: Staff) {
     const data = await loadAll();
-    const priceList = ['manager', 'billing'].includes(user.role) ? await readPriceList() : undefined;
+    const prices = ['manager', 'billing', 'doctor'].includes(user.role) ? await readPriceList() : undefined;
+    const priceList = user.role === 'doctor' ? undefined : prices;
+    const labTestNames = user.role === 'doctor' && prices
+        ? labTestCatalog(prices).filter(test => test.available).map(test => test.name)
+        : undefined;
     const patients = data.patients.filter(p => roleCanReadPatient(user, p, data.labs, data.invoices));
     const ids = new Set(patients.map(p => p.id));
     const labVisitIds = new Set(data.labs.map(l => l.visitId));
@@ -71,33 +74,52 @@ export async function visibleData(user: Staff) {
     const reviewSummary = (review: any) => review?.reviewedAt ? { reportApprovedAt: review.reportApprovedAt, reviewedAt: review.reviewedAt, reviewedBy: review.reviewedBy } : {};
     const labs = user.role === 'laboratory' ? data.labs.map(l => ({ ...l, doctorReview: reviewSummary(l.doctorReview), history: (l.history as any[]).map(h => ({ ...h, doctorReview: reviewSummary(h.doctorReview) })) })) : user.role === 'doctor' ? data.labs.filter(l => ids.has(l.patientId)).map(l => l.status === 'approved' ? l : ({ id: l.id, patientId: l.patientId, visitId: l.visitId, testName: l.testName, status: l.status, sourceRef: l.sourceRef, updatedAt: l.updatedAt })) : [];
     const invoices = user.role === 'billing' ? data.invoices : [];
-    const reviews = data.reviews.filter(r => user.role === 'reviewer' || user.role === r.ownerRole || (user.role === 'laboratory' && r.ownerRole === 'laboratory'));
+    const reviewer = user.role === 'reviewer';
+    const storedReviews = data.reviews.filter(review => reviewer
+        ? review.kind !== 'lab' || review.state !== 'open'
+        : review.ownerRole === user.role);
+    const approvedReportIssues = reviewer ? data.labs.flatMap(report => {
+        if (report.status !== 'approved') return [];
+        const problems = labProblems(report, data.visits.find(visit => visit.id === report.visitId));
+        if (!problems.length) return [];
+        return [{
+            id: `approved-lab-${report.id}`,
+            kind: 'lab',
+            patientId: report.patientId,
+            recordId: report.id,
+            title: 'Approved report needs a laboratory check',
+            detail: problems.join(' '),
+            ownerRole: 'laboratory',
+            state: 'open',
+            createdAt: report.approvedAt || report.updatedAt,
+        }];
+    }) : [];
+    const reviews = [...approvedReportIssues, ...storedReviews];
     const imports = ['laboratory', 'billing', 'reviewer', 'registration'].includes(user.role) ? data.imports.filter(i => user.role !== 'laboratory' && user.role !== 'billing' || i.source === user.role).map(i => {
         const p = i.payload as any;
         return { ...i, payload: user.role === 'laboratory' && i.source === 'laboratory' || user.role === 'billing' && i.source === 'billing' ? p : { patientId: p.patientId, patientName: p.patientName, patientDob: p.patientDob, visitId: p.visitId } };
     }) : [];
     const facts = user.role === 'reviewer' ? data.facts : [];
-    await ensureNotificationBacklog(user, { patients, visits, labs, invoices, reviews });
+    await ensureNotificationBacklog(user, { patients, visits, labs, invoices, reviews: storedReviews });
     const notificationList = await repository.find("staffNotifications", allOf(match("recipientId", user.id), match("recipientRole", user.role)), { orderBy: "createdAt", limit: 250 });
+    const legacyLabReviewIds = new Set(reviewer ? data.reviews.filter(review => review.kind === 'lab').map(review => review.id) : []);
     const notifications = notificationList.filter(n => !n.patientId || ids.has(n.patientId))
+        .filter(n => !reviewer || (!n.eventKey.startsWith('quality:') && !legacyLabReviewIds.has(n.entityId)))
         .map(({ recipientId, recipientRole, eventKey, ...n }) => n);
     const billingServices = user.role === 'billing' ? data.visits.filter(v => v.status === 'signed' && (v.billingReadyAt || data.invoices.some(invoice => invoice.visitId === v.id))).map(v => ({
         visitId: v.id, patientId: v.patientId, consultation: v.status === 'signed',
         tests: data.labs.filter(l => l.visitId === v.id && l.status === 'approved').map(l => ({ id: l.id, name: l.testName })),
         charges: chargeOffers(v, data.labs, data.staff, priceList!, data.invoices.find(invoice => invoice.visitId === v.id)),
     })) : [];
-    const incompleteReports = data.labs.filter(l => l.status !== 'requested' && l.status !== 'approved' && labProblems(l, data.visits.find(v => v.id === l.visitId)).length);
-    const quality = user.role === 'reviewer' ? {
-        identityQuestions: data.reviews.filter(r => r.state === 'open' && r.kind === 'identity').length,
-        incompleteReports: incompleteReports.length,
-        heldImports: data.imports.filter(i => i.state === 'held').length,
-        invalidApproved: data.labs.filter(l => l.status === 'approved' && labProblems(l, data.visits.find(v => v.id === l.visitId)).length).length,
+    const quality = reviewer ? {
+        identityQuestions: storedReviews.filter(r => r.state === 'open' && r.kind === 'identity').length,
+        invalidApproved: approvedReportIssues.length,
         checkedAt: now(),
     } : undefined;
     return {
         user, patients: patients.map(p => ['laboratory', 'billing'].includes(user.role) ? { id: p.id, name: p.name, dob: p.dob, version: p.version, doctorId: p.doctorId, updatedAt: p.updatedAt, source: p.source } : p),
         visits, labs, invoices, reviews, imports, facts, runs: user.role === 'reviewer' ? data.runs : [],
-        notifications, billingServices, quality, priceList,
+        notifications, billingServices, quality, priceList, labTestNames,
         staff: user.role === 'manager' ? data.staff : data.staff.filter(u => u.role === 'doctor' && u.active).map(u => ({ id: u.id, name: u.name, role: u.role })),
         // History is fetched separately with permission-scoped pagination.
         history: [],
@@ -134,7 +156,7 @@ export async function refreshWarehouse(user: Staff) {
             const statements: any[] = [store.remove("warehouseFacts")];
             for (let i = 0; i < facts.length; i += 5)
                 statements.push(store.insert("warehouseFacts", facts.slice(i, i + 5)));
-            statements.push(store.insert("warehouseRuns", { id: runId, at, userId: user.id, count: facts.length, summary: { ...summarizeFacts(facts), formatVersion: 2 } }), store.insert("activityHistory", auditRow(user, 'Refreshed reporting copies', 'warehouse', runId, `${facts.length} checked facts copied. Draft results and held imports excluded.`)));
+            statements.push(store.insert("warehouseRuns", { id: runId, at, userId: user.id, count: facts.length, summary: { ...summarizeFacts(facts), formatVersion: 2 } }), store.insert("activityHistory", auditRow(user, 'Refreshed reporting copies', 'warehouse', runId, `${facts.length} checked facts copied. Unfinished consultations and incomplete or unapproved laboratory reports excluded.`)));
             await store.batch(statements as any);
             return { count: facts.length, refreshedAt: at };
         }, { lock: 20261103, isolationLevel: 'Serializable' });

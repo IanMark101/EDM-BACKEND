@@ -5,7 +5,9 @@ import { ensureSeed } from '../repositories/seed';
 import { hashPassword, randomToken, constantEqual, digest, SESSION_MS, sessionCookie, cookieToken, requireSameOrigin } from './security';
 import { notificationRows, notificationInsert } from './notifications';
 import { cleanClinical, cleanMeasurements, LAB_LAYOUTS } from '../../../shared/clinical';
+import { labTestCatalog, serviceNameKey } from '../../../shared/billing';
 import { managedInvoicesService, pricedImportItems } from './billing.service';
+import { readPriceList } from '../repositories/pricing.repository';
 import { result } from '../http/result';
 import type { ServiceContext } from '../http/context';
 // Coordinate identity edits, new visits and doctor availability.
@@ -23,27 +25,6 @@ function invoiceItems(items: any) {
         return { description: cleanText(item.description, 'Service description', 160), amount: moneyCents(item.amount, 'Charge') };
     });
 }
-async function syncLabReview(report: any, visit: any, user: Staff, store: ClinicRepository = repository) {
-    const open = await store.find("qualityReviews", allOf(match("recordId", report.id), match("state", 'open')));
-    const problems = labProblems(report, visit);
-    if (!problems.length) {
-        if (open.length)
-            await store.update("qualityReviews", { state: 'resolved', resolvedAt: now(), resolvedBy: user.name, resolution: 'Required laboratory details checked.', evidence: 'Patient, visit, result, unit and collection time were checked by laboratory staff.' }, allOf(match("recordId", report.id), match("state", 'open')));
-    }
-    else if (open.length) {
-        const detail = problems.join(' ');
-        if (open.some(review => review.detail !== detail))
-            await store.update("qualityReviews", { detail }, allOf(match("recordId", report.id), match("state", 'open')));
-    }
-    else {
-        const issueId = newId('Q');
-        const notices = await notificationRows(user, { key: `quality:${issueId}`, roles: ['reviewer', 'laboratory'], kind: 'due', body: 'saved a report that needs details:', subject: report.id, patientId: report.patientId, entityId: issueId, href: `/clinic/review?open=${issueId}` }, store);
-        // Laboratory recipients open the report itself, rather than the reviewer's screen.
-        notices.forEach(n => { if (n.recipientRole === 'laboratory')
-            n.href = `/clinic/laboratory?open=${report.id}`; });
-        await store.batch([store.insert("qualityReviews", { id: issueId, kind: 'lab', patientId: report.patientId, recordId: report.id, title: 'Laboratory details incomplete', detail: problems.join(' '), ownerRole: 'laboratory', createdAt: now() }), ...notificationInsert(notices)]);
-    }
-}
 async function materializeImport(imported: any, patientId: string, visitId: string, user: Staff, store: ClinicRepository = repository) {
     const p = cleanImportPayload(imported.source, imported.payload);
     const visit = requiredRow((await store.find("visits", match("id", visitId)))[0]);
@@ -55,7 +36,6 @@ async function materializeImport(imported: any, patientId: string, visitId: stri
             throw new AppError('Choose a started or completed consultation for this laboratory record.', 422);
         const report = { id, patientId, visitId, testName: cleanText(p.testName, 'Test name', 120), value: cleanText(p.value, 'Result', 3000, false), unit: cleanText(p.unit, 'Unit', 80, false), collectedAt: cleanText(p.collectedAt, 'Collection time', 40, false), status: 'draft', requestedBy: visit.doctorId, sourceRef: imported.externalId, updatedAt: now() };
         await store.batch([store.insert("labReports", report), store.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), store.insert("activityHistory", auditRow(user, 'Received laboratory record', 'import', imported.externalId, 'Source reference retained. Report saved as a draft for laboratory review.', patientId))]);
-        await syncLabReview(report, visit, user, store);
     }
     else {
         if (visit.status !== 'signed')
@@ -295,10 +275,20 @@ export async function labsService(context: ServiceContext) {
             throw new AppError('Choose one of your visits for this patient.', 422);
         if (visit.status === 'waiting' || visit.status === 'cancelled')
             throw new AppError('Start the consultation before requesting a test.', 422);
-        const labId = newId('L');
-        const notices = await notificationRows(user, { key: `lab-request:${labId}`, roles: ['laboratory'], kind: 'request', body: 'requested a laboratory test for', subject: patient.name, patientId: patient.id, entityId: labId, href: `/clinic/laboratory?open=${labId}` });
-        await repository.batch([repository.insert("labReports", { id: labId, patientId: patient.id, visitId: visit.id, testName: cleanText(input.testName, 'Test name', 120), requestedBy: user.id, sourceRef: newId('LAB'), updatedAt: now() }), repository.insert("activityHistory", auditRow(user, 'Requested laboratory test', 'lab', labId, 'Request linked to the confirmed patient and visit.', patient.id)), ...notificationInsert(notices)]);
-        return result({ id: labId }, 201);
+        const testName = serviceNameKey(cleanText(input.testName, 'Test name', 120));
+        return repository.transaction(async store => {
+            const test = labTestCatalog(await readPriceList(store)).find(test => test.available && serviceNameKey(test.name) === testName);
+            if (!test)
+                throw new AppError('Choose an available laboratory test. If the list changed, refresh the workspace and try again.', 422);
+            const labId = newId('L');
+            const notices = await notificationRows(user, { key: `lab-request:${labId}`, roles: ['laboratory'], kind: 'request', body: 'requested a laboratory test for', subject: patient.name, patientId: patient.id, entityId: labId, href: `/clinic/laboratory?open=${labId}` }, store);
+            await store.batch([
+                store.insert("labReports", { id: labId, patientId: patient.id, visitId: visit.id, testName: test.name, requestedBy: user.id, sourceRef: newId('LAB'), updatedAt: now() }),
+                store.insert("activityHistory", auditRow(user, 'Requested laboratory test', 'lab', labId, 'Request linked to the confirmed patient and visit.', patient.id)),
+                ...notificationInsert(notices),
+            ]);
+            return result({ id: labId }, 201);
+        }, { lock: 20261105 });
     }
     assertRole(user, ['laboratory']);
     const old = requiredRow((await repository.find("labReports", match("id", id)))[0]);
@@ -345,7 +335,16 @@ export async function labsService(context: ServiceContext) {
     const notices = mode === 'save' ? [] : await notificationRows(user, { key: `lab-approved:${id}:${old.version}`, staffIds: [patient.doctorId!], kind: urgency === 'urgent' ? 'due' : mode === 'correct' ? 'edit' : 'file', body: urgency === 'urgent' ? 'sent an urgent approved report for' : mode === 'correct' ? 'corrected an approved report for' : 'approved a laboratory report for', subject: patient.name, patientId: patient.id, entityId: id, href: `/clinic/laboratory?open=${id}` });
     await repository.transaction(async store => {
         await updateWithHistory("labReports", old, input.version, patch, auditRow(user, mode === 'correct' ? 'Approved report correction' : mode === 'approve' ? 'Approved laboratory report' : 'Saved laboratory draft', 'lab', id, reason || (problems.length ? `Required details still missing: ${problems.join(' ')}` : 'Required details checked; laboratory staff remain responsible for checking the report content.'), old.patientId), notices, store);
-        await syncLabReview({ ...report, ...patch }, visit, user, store);
+        if (mode !== 'save') {
+            // Close checks created by earlier versions once Laboratory approves the report.
+            await store.update("qualityReviews", {
+                state: 'resolved',
+                resolvedAt: now(),
+                resolvedBy: user.name,
+                resolution: 'Laboratory completed and approved the report.',
+                evidence: 'Laboratory staff confirmed the required report details before approval.',
+            }, allOf(match("recordId", id), match("kind", 'lab'), match("state", 'open')));
+        }
     });
     return result({ id });
 }
@@ -374,7 +373,11 @@ export async function reviewsService(context: ServiceContext) {
             await store.update("sourceImports", { state: 'kept-separate' }, match("id", imported.id));
         else
             throw new AppError('Choose to link the confirmed record or keep it separate.', 422);
-        const notices = await notificationRows(user, { key: `identity-resolved:${id}`, roles: [imported.source as 'laboratory' | 'billing', 'reviewer'], kind: 'edit', body: 'resolved the patient match for', subject: imported.externalId, entityId: id, href: '/clinic/sources' }, store);
+        const notices = await notificationRows(user, { key: `identity-resolved:${id}`, roles: [imported.source as 'laboratory' | 'billing', 'reviewer'], kind: 'edit', body: 'resolved the patient match for', subject: imported.externalId, entityId: id, href: `/clinic/review?open=${id}` }, store);
+        notices.forEach(notice => {
+            if (notice.recipientRole === 'laboratory') notice.href = input.decision === 'link' ? `/clinic/laboratory?open=L-IMP-${imported.externalId}` : '/clinic/laboratory';
+            if (notice.recipientRole === 'billing') notice.href = input.decision === 'link' ? `/clinic/billing?open=B-IMP-${imported.externalId}` : '/clinic/billing';
+        });
         await store.batch([store.update("qualityReviews", { state: 'resolved', resolution: input.decision === 'link' ? 'Identity confirmed and source record linked.' : 'Kept separate after identity review.', evidence: reason, resolvedBy: user.name, resolvedAt: now() }, match("id", id)), store.insert("activityHistory", auditRow(user, 'Resolved identity review', 'review', id, `${input.decision}: ${reason}`, review.patientId || undefined)), ...notificationInsert(notices)]);
         return result({ id });
     }, { lock: 20261105 });

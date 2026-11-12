@@ -33,7 +33,6 @@ export const routes: Route[] = [
   { method: 'POST', area: 'labs', handler: controllers.labs },
   { method: 'POST', area: 'invoices', handler: controllers.invoices },
   { method: 'POST', area: 'reviews', handler: controllers.reviews },
-  { method: 'POST', area: 'imports', handler: controllers.imports },
   { method: 'POST', area: 'warehouse', id: 'refresh', handler: controllers.warehouse },
   { method: 'POST', area: 'staff', handler: controllers.staff },
 ];
