@@ -147,12 +147,12 @@ export async function patientPortalRecords({ request }: ServiceContext) {
   const doctors = completed.length ? await repository.find('staffAccounts', oneOf('id', [...new Set(completed.map(visit => visit.doctorId))])) : [];
   const names = new Map(doctors.map(doctor => [doctor.id, doctor.name]));
   const labs = reports.flatMap(report => {
-    const review = report.doctorReview as { reviewedAt?: string; reportApprovedAt?: string; releasedAt?: string; plan?: string; followUpDate?: string } | null;
+    const review = report.doctorReview as { reviewedAt?: string; reportApprovedAt?: string; releasedAt?: string; plan?: string; followUpDate?: string; followUpTime?: string } | null;
     const visit = visitsById.get(report.visitId);
     if (!review?.releasedAt || !review.reviewedAt || review.reportApprovedAt !== report.approvedAt || !visit || visit.status === 'cancelled' || labProblems(report, visit).length) return [];
     const measurements = (report.measurements as { name: string; result: string; unit: string; reference?: string; flag?: string }[]).map(({ name, result, unit, reference, flag }) => ({ name, result, unit, reference, flag }));
     return [{ id: report.id, visitId: report.visitId, testName: report.testName, releasedAt: review.releasedAt, collectedAt: report.collectedAt,
-      measurements: measurements.length ? measurements : [{ name: report.testName, result: report.value, unit: report.unit }], followUpDate: review.followUpDate }];
+      measurements: measurements.length ? measurements : [{ name: report.testName, result: report.value, unit: report.unit }], followUpDate: review.followUpDate, followUpTime: review.followUpTime || '' }];
   });
   if (Date.parse(session.lastSeen) < Date.now() - 30_000) await repository.update('patientPortalSessions', { lastSeen: now() }, match('tokenHash', tokenHash));
   return result({ patient: { id: patient.id, name: patient.name },

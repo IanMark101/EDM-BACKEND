@@ -2,7 +2,7 @@ import { VITAL_FIELDS } from '../../../shared/clinical.ts';
 
 const h = (value: unknown) => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 const money = (cents: number) => `PHP ${(cents / 100).toLocaleString('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-const time = (value: string) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Taipei' }).format(new Date(value)) + ' UTC+8' : 'Not recorded';
+const time = (value: string, showSeconds = false) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium', timeStyle: showSeconds ? 'medium' : 'short', timeZone: 'Asia/Taipei' }).format(new Date(value)) + ' UTC+8' : 'Not recorded';
 const section = (label: string, text: unknown) => `<section><h2>${h(label)}</h2><p class="pre">${h(text || 'Not recorded')}</p></section>`;
 const table = (heads: string[], rows: unknown[][]) => `<table><thead><tr>${heads.map(v => `<th>${h(v)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(v => `<td>${h(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
 export function renderDocument(kind: string, record: any, patient: any, staff: any[], clinic: any, payment?: any) {
@@ -17,7 +17,7 @@ export function renderDocument(kind: string, record: any, patient: any, staff: a
         section('Current medicines', c.medicines) + table(['Measurement', 'Recorded value'], VITAL_FIELDS.filter(([key]) => c.vitals?.[key]).map(([key, label, unit]) => [label, `${c.vitals[key]} ${unit}`])) +
         section('Examination findings', c.findings) + section('Assessment', c.assessment) + section('Care plan', c.plan) : '');
   } else if (kind === 'lab') {
-    body = `<p>Test: ${h(record.testName)}<br>Sample: ${h(record.specimen || 'Not recorded')}<br>Collected: ${h(time(record.collectedAt))}<br>Approved by: ${h(person(record.approvedBy))}<br>Approved: ${h(time(record.approvedAt))}</p>` +
+    body = `<p>Test: ${h(record.testName)}<br>Sample: ${h(record.specimen || 'Not recorded')}<br>Sample collected: ${h(time(record.collectedAt, true))}<br>Approved by: ${h(person(record.approvedBy))}<br>Report approved: ${h(time(record.approvedAt, true))}</p>` +
       (record.urgency === 'urgent' ? section('Urgent clinician review', `Contacted ${record.contact?.person || 'responsible clinician'} by ${record.contact?.method || 'recorded contact'} at ${time(record.contact?.at)}.`) : '') +
       (record.measurements?.length ? table(['Measurement', 'Result', 'Unit', 'Laboratory reference', 'Lab flag'], record.measurements.map((r: any) => [r.name, r.result, r.unit, r.reference || 'Not supplied', r.flag || ''])) : table(['Result', 'Unit'], [[record.value, record.unit]])) +
       (record.reportComment ? section('Laboratory comment', record.reportComment) : '') + `<p>Source reference: ${h(record.sourceRef)}</p>`;

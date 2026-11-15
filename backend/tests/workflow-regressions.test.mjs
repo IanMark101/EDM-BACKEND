@@ -770,6 +770,39 @@ test('portal activation is single use and staff can replace access without expos
   assert.equal((await api('patient-access/P-1', undefined, await staffCookie(manager))).status, 403);
 });
 
+test('doctor reviews save a return time and accept existing date-only appointment inputs', async () => {
+  const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
+  const cases = [
+    { followUpDate: '2026-01-10', followUpTime: '09:30' },
+    { followUpDate: '2026-01-10' },
+    { followUpDate: '' },
+  ];
+  for (const [index, schedule] of cases.entries()) {
+    const id = `L-SCHEDULE-${index}`;
+    db.tables.labReport.push({ id, patientId: 'P-1', visitId: 'V-1', version: 1, status: 'approved', approvedAt: '2026-01-02T03:00:00Z', doctorReview: {} });
+    const response = await api(`labs/${id}/doctor-review`, { version: 1, confirmed: true, plan: 'Reviewed the result with the patient.', ...schedule }, doctor);
+    assert.equal(response.status, 200);
+    const review = db.tables.labReport.find(report => report.id === id).doctorReview;
+    assert.equal(review.followUpDate, schedule.followUpDate);
+    assert.equal(review.followUpTime, schedule.followUpTime || '');
+  }
+});
+
+test('doctor reviews reject invalid return times and a time without a date before saving', async () => {
+  const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
+  db.tables.labReport.push({ id: 'L-TIME-CHECK', patientId: 'P-1', visitId: 'V-1', version: 1, status: 'approved', approvedAt: '2026-01-02T03:00:00Z', doctorReview: {} });
+  for (const schedule of [
+    { followUpDate: '', followUpTime: '09:30' },
+    { followUpDate: '2026-01-10', followUpTime: '25:00' },
+    { followUpDate: '2026-01-10', followUpTime: '09:60' },
+    { followUpDate: '2026-01-10', followUpTime: '9:30' },
+  ]) {
+    const response = await api('labs/L-TIME-CHECK/doctor-review', { version: 1, confirmed: true, plan: 'Reviewed the result with the patient.', ...schedule }, doctor);
+    assert.equal(response.status, 422);
+    assert.deepEqual(db.tables.labReport[0].doctorReview, {});
+  }
+});
+
 test('portal shows only the session patient and current released result, even with another patient requested', async () => {
   const frontdesk = await staffCookie({ id: 'U-FRONT', name: 'Front desk', role: 'registration', active: true });
   const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
@@ -785,13 +818,14 @@ test('portal shows only the session patient and current released result, even wi
   const activated = await api('patient-portal/activate', { patientId: 'P-1', code, password: 'FictionalPass123!' });
   const cookie = activated.headers.getSetCookie()[0].split(';')[0];
   assert.equal((await api('labs/L-1/patient-release', { confirmed: true, version: 1 }, doctor)).status, 422);
-  assert.equal((await api('labs/L-1/doctor-review', { confirmed: true, version: 1, plan: 'PRIVATE_FOLLOWUP' }, doctor)).status, 200);
+  assert.equal((await api('labs/L-1/doctor-review', { confirmed: true, version: 1, plan: 'PRIVATE_FOLLOWUP', followUpDate: '2026-01-10', followUpTime: '09:30' }, doctor)).status, 200);
   assert.equal((await api('labs/L-1/patient-release', { confirmed: true, version: 2 }, otherDoctor)).status, 403);
   assert.equal((await (await api('patient-portal', undefined, cookie)).json()).labs.length, 0);
   assert.equal((await api('labs/L-1/patient-release', { confirmed: true, version: 2 }, doctor)).status, 200);
   const data = await (await api('patient-portal?patientId=P-OTHER', undefined, cookie)).json();
   assert.equal(data.patient.id, 'P-1'); assert.deepEqual(data.visits.map(row => row.id), ['V-1']);
   assert.equal(data.labs[0].measurements[0].result, '92'); assert.equal(data.bills[0].paid, 50000);
+  assert.equal(data.labs[0].followUpDate, '2026-01-10'); assert.equal(data.labs[0].followUpTime, '09:30');
   assert.ok(!/PRIVATE_|P-OTHER|B-OTHER/.test(JSON.stringify(data)));
   db.tables.labReport[0].approvedAt = '2026-01-02T04:00:00.000Z';
   assert.equal((await (await api('patient-portal', undefined, cookie)).json()).labs.length, 0);
