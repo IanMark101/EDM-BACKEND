@@ -60,15 +60,21 @@ export async function clinicSettingsService(context: ServiceContext) {
         return result({ ok: true });
     }
 }
-export async function doctorReviewService(context: ServiceContext) {
-    const { request, user, id, action, input } = context;
-    assertRole(user, ['doctor']);
+function returnAppointment(input: { followUpDate?: unknown; followUpTime?: unknown }) {
     const followUpDate = cleanText(input.followUpDate, 'Return appointment date', 10, false);
     const followUpTime = cleanText(input.followUpTime, 'Return appointment time', 5, false);
     if (followUpTime && !/^([01]\d|2[0-3]):[0-5]\d$/.test(followUpTime))
         throw new AppError('Enter a valid return appointment time.', 422);
     if (followUpTime && !followUpDate)
         throw new AppError('Choose a return appointment date before setting its time.', 422);
+    if (followUpDate && (!/^\d{4}-\d{2}-\d{2}$/.test(followUpDate) || !Number.isFinite(Date.parse(followUpDate)) || new Date(followUpDate).toISOString().slice(0, 10) !== followUpDate))
+        throw new AppError('Enter a valid return appointment date.', 422);
+    return { followUpDate, followUpTime };
+}
+export async function doctorReviewService(context: ServiceContext) {
+    const { request, user, id, action, input } = context;
+    assertRole(user, ['doctor']);
+    const { followUpDate, followUpTime } = returnAppointment(input);
     
     const old = (await repository.find("labReports", match("id", id)))[0];
     if (!old || old.status !== 'approved')
@@ -81,10 +87,24 @@ export async function doctorReviewService(context: ServiceContext) {
     if (input.confirmed !== true)
         throw new AppError('Confirm that you reviewed the approved report.', 422);
     const plan = cleanText(input.plan, 'Follow-up decision and plan', 3000);
-    if (followUpDate && (!/^\d{4}-\d{2}-\d{2}$/.test(followUpDate) || !Number.isFinite(Date.parse(followUpDate)) || new Date(followUpDate).toISOString().slice(0, 10) !== followUpDate))
-        throw new AppError('Enter a valid follow-up date.', 422);
     const doctorReview = { reportApprovedAt: old.approvedAt, reviewedAt: now(), reviewedBy: user.name, reviewedById: user.id, plan, followUpDate, followUpTime };
     await updateWithHistory("labReports", old, input.version, { doctorReview }, auditRow(user, 'Reviewed approved laboratory report', 'lab', id, 'Doctor review and follow-up decision recorded for this approved version.', old.patientId));
+    return result({ ok: true });
+}
+
+export async function returnAppointmentService({ user, id, input }: ServiceContext) {
+    assertRole(user, ['doctor']);
+    const schedule = returnAppointment(input);
+    const report = (await repository.find('labReports', match('id', id)))[0];
+    if (!report || report.status !== 'approved' || needsDoctorReview(report) || !(report.doctorReview as any)?.reviewedAt)
+        throw new AppError('Review the current approved report before updating its return appointment.', 422);
+    const { patient } = await permittedPatient(user, report.patientId);
+    if (patient.doctorId !== user.id)
+        throw new AppError('This report is outside your patient assignment.', 403);
+    const review = report.doctorReview as { followUpDate?: string; followUpTime?: string };
+    await updateWithHistory('labReports', report, input.version, { doctorReview: { ...review, ...schedule } },
+        auditRow(user, 'Updated return appointment', 'lab', id,
+            `Previous appointment: ${review.followUpDate || 'No date'} ${review.followUpTime || ''}. Updated appointment: ${schedule.followUpDate || 'No date'} ${schedule.followUpTime || ''}. Clinic time, UTC+8.`, patient.id));
     return result({ ok: true });
 }
 

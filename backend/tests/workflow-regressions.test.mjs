@@ -803,6 +803,26 @@ test('doctor reviews reject invalid return times and a time without a date befor
   }
 });
 
+test('only the assigned doctor can update an existing return appointment without replacing the review or release', async () => {
+  const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
+  const otherDoctor = await staffCookie({ id: 'D-2', name: 'Other doctor', role: 'doctor', active: true });
+  const laboratory = await staffCookie({ id: 'U-LAB', name: 'Laboratory', role: 'laboratory', active: true });
+  const approvedAt = '2026-01-02T03:00:00Z';
+  const review = { reportApprovedAt: approvedAt, reviewedAt: '2026-01-02T03:30:00Z', releasedAt: '2026-01-02T03:40:00Z', reviewedBy: 'Assigned doctor', plan: 'Original review notes.', followUpDate: '2026-01-10' };
+  db.tables.labReport.push({ id: 'L-SCHEDULE', patientId: 'P-1', visitId: 'V-1', version: 1, status: 'approved', approvedAt, doctorReview: { ...review } });
+  const schedule = { version: 1, followUpDate: '2026-01-11', followUpTime: '14:15' };
+  assert.equal((await api('labs/L-SCHEDULE/return-appointment', schedule, otherDoctor)).status, 403);
+  assert.equal((await api('labs/L-SCHEDULE/return-appointment', schedule, laboratory)).status, 403);
+  assert.equal((await api('labs/L-SCHEDULE/return-appointment', { ...schedule, version: 0 }, doctor)).status, 409);
+  assert.deepEqual(db.tables.labReport[0].doctorReview, review);
+  assert.equal((await api('labs/L-SCHEDULE/return-appointment', schedule, doctor)).status, 200);
+  assert.deepEqual(db.tables.labReport[0].doctorReview, { ...review, followUpDate: '2026-01-11', followUpTime: '14:15' });
+  assert.equal(db.tables.labReport[0].approvedAt, approvedAt);
+  assert.ok(db.tables.activityHistory.some(row => row.action === 'Updated return appointment'));
+  db.tables.labReport[0].approvedAt = '2026-01-02T04:00:00Z';
+  assert.equal((await api('labs/L-SCHEDULE/return-appointment', { ...schedule, version: 2 }, doctor)).status, 422);
+});
+
 test('portal shows only the session patient and current released result, even with another patient requested', async () => {
   const frontdesk = await staffCookie({ id: 'U-FRONT', name: 'Front desk', role: 'registration', active: true });
   const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
@@ -827,6 +847,8 @@ test('portal shows only the session patient and current released result, even wi
   assert.equal(data.labs[0].measurements[0].result, '92'); assert.equal(data.bills[0].paid, 50000);
   assert.equal(data.labs[0].followUpDate, '2026-01-10'); assert.equal(data.labs[0].followUpTime, '09:30');
   assert.ok(!/PRIVATE_|P-OTHER|B-OTHER/.test(JSON.stringify(data)));
+  assert.equal((await api('labs/L-1/return-appointment', { version: db.tables.labReport[0].version, followUpDate: '2026-01-10', followUpTime: '10:45' }, doctor)).status, 200);
+  assert.equal((await (await api('patient-portal', undefined, cookie)).json()).labs[0].followUpTime, '10:45');
   db.tables.labReport[0].approvedAt = '2026-01-02T04:00:00.000Z';
   assert.equal((await (await api('patient-portal', undefined, cookie)).json()).labs.length, 0);
   assert.equal((await api('patient-portal/logout', {}, cookie)).status, 200);

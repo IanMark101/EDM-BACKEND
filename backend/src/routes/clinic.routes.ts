@@ -11,6 +11,7 @@ export const routes: Route[] = [
   { method: 'GET', area: 'service-prices', handler: controllers.servicePrices },
   { method: 'POST', area: 'service-prices', handler: controllers.servicePrices },
   { method: 'POST', area: 'labs', action: 'doctor-review', handler: controllers.doctorReview },
+  { method: 'POST', area: 'labs', action: 'return-appointment', handler: controllers.returnAppointment },
   { method: 'POST', area: 'labs', action: 'patient-release', handler: controllers.patientResultRelease },
   { method: 'GET', area: 'documents', handler: controllers.document },
   { method: 'POST', area: 'login', handler: controllers.login },

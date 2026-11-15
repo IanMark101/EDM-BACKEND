@@ -105,6 +105,7 @@ export const controllers = {
   clinicSettings: controller({ service: operations.clinicSettingsService, limit: 20_000 }),
   servicePrices: controller({ service: servicePricesService, limit: 20_000 }),
   doctorReview: controller({ service: operations.doctorReviewService, limit: 20_000 }),
+  returnAppointment: controller({ service: operations.returnAppointmentService, limit: 20_000 }),
   patientResultRelease: controller({ service: operations.patientResultReleaseService, limit: 20_000 }),
   document: controller({ service: operations.documentService, limit: 20_000 }),
 };
