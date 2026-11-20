@@ -1,5 +1,5 @@
 import { repository, match, allOf, oneOf, type ClinicRepository } from '../repositories/clinic.repository';
-import { AppError, assertRole, cleanText, dateOnly, validatePatient, moneyCents, identityKey, labProblems, ROLES, publicStaff, csvCell, type Staff } from '../../../shared/domain';
+import { AppError, assertRole, cleanText, cleanPersonName, clinicDay, dateOnly, validatePatient, moneyCents, identityKey, labProblems, ROLES, publicStaff, csvCell, type Staff } from '../../../shared/domain';
 import { authenticate, audit, auditRow, now, newId, visibleData, permittedPatient, loadAll, updateWithHistory, refreshWarehouse } from './server';
 import { ensureSeed } from '../repositories/seed';
 import { hashPassword, randomToken, constantEqual, digest, SESSION_MS, sessionCookie, cookieToken, requireSameOrigin } from './security';
@@ -44,7 +44,8 @@ async function materializeImport(imported: any, patientId: string, visitId: stri
             throw new AppError('This visit already has a bill. Billing staff must check it and use Add a charge for a later service, rather than receive a second bill.', 409);
         const items = await pricedImportItems(visit, p.items, user, store);
         const total = items.reduce((sum: number, item: any) => sum + item.amount, 0);
-        await store.batch([store.insert("invoices", { id, patientId, visitId, date: dateOnly(p.date, 'Bill date'), items, total, sourceRef: imported.externalId, updatedAt: now() }), store.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), store.insert("activityHistory", auditRow(user, 'Received billing record', 'import', imported.externalId, 'A checked source bill was linked to the selected patient and visit.', patientId))]);
+        const billDate = dateOnly(p.date, 'Bill date'); if (visit.date && billDate < visit.date) throw new AppError('Bill date cannot be earlier than the visit date.', 422);
+        await store.batch([store.insert("invoices", { id, patientId, visitId, date: billDate, items, total, sourceRef: imported.externalId, updatedAt: now() }), store.update("sourceImports", { state: 'imported', linkedPatientId: patientId }, match("id", imported.id)), store.insert("activityHistory", auditRow(user, 'Received billing record', 'import', imported.externalId, 'A checked source bill was linked to the selected patient and visit.', patientId))]);
     }
 }
 export async function loginService(context: ServiceContext) {
@@ -159,6 +160,8 @@ export async function checkInsService(context: ServiceContext) {
     const date = dateOnly(input.date, 'Visit date');
     return repository.transaction(async store => {
         const patient = requiredRow((await store.find("patients", match("id", input.patientId)))[0]);
+
+        if (patient.dob && date < patient.dob) throw new AppError('Visit date cannot be earlier than the patient’s birth date.', 422);
         const [active] = await store.find("visits", allOf(match("patientId", patient.id), openVisitStatuses), { orderBy: "date", limit: 1 });
         if (active) return result({ id: active.id, alreadyWaiting: true });
         const doctor = (await store.find("staffAccounts", match("id", patient.doctorId!)))[0];
@@ -228,6 +231,7 @@ export async function visitsService(context: ServiceContext) {
             const [doctor] = await store.find("staffAccounts", match("id", user.id));
             if (patient?.doctorId !== user.id || !doctor?.active || doctor.role !== 'doctor')
                 throw new AppError('This patient is not available to your account.', 403);
+            if (patient.dob && row.date < patient.dob) throw new AppError('Visit date cannot be earlier than the patient’s birth date.', 422);
             const [ongoing] = await store.find("visits", allOf(match("patientId", patient.id), openVisitStatuses), { limit: 1 });
             if (ongoing)
                 throw new AppError(`Visit ${ongoing.id} is already open. Continue that visit instead of creating another consultation.`, 409);
@@ -317,6 +321,13 @@ export async function labsService(context: ServiceContext) {
     };
     if (contact.at && (!Number.isFinite(Date.parse(contact.at)) || Date.parse(contact.at) > Date.now() + 60000))
         throw new AppError('Enter a valid contact time that is not in the future.', 422);
+    if (contact.at) {
+        const contactTime = Date.parse(contact.at);
+        if (fields.collectedAt && Number.isFinite(Date.parse(fields.collectedAt)) && contactTime < Date.parse(fields.collectedAt))
+            throw new AppError('Clinician contact time cannot be earlier than the sample collection time.', 422);
+        if (visit.date && clinicDay(new Date(contactTime)) < visit.date)
+            throw new AppError('Clinician contact date cannot be earlier than the visit date.', 422);
+    }
     if (mode !== 'save' && urgency === 'urgent' && (!contact.person || !contact.method || !contact.at))
         throw new AppError('For an urgent report, contact the responsible clinician and record their name, contact method and time before approval.', 422);
     const report = { ...old, ...fields, layout, measurements,
@@ -365,6 +376,7 @@ export async function reviewsService(context: ServiceContext) {
         const imported = requiredRow((await store.find("sourceImports", match("id", review.recordId)))[0]);
         if (input.decision === 'link') {
             const patient = requiredRow((await store.find("patients", match("id", input.patientId)))[0]);
+
             if (cleanText(input.confirmedDob, 'Verified birth date', 10) !== patient.dob)
                 throw new AppError('The verified birth date does not match the selected patient. Keep the records separate until confirmed.', 422);
             await materializeImport(imported, patient.id, cleanText(input.visitId, 'Verified visit', 80), user, store);
@@ -391,7 +403,7 @@ function cleanImportPayload(source: string, value: any) {
     if (!/^[a-zA-Z0-9_-]+$/.test(externalId))
         throw new AppError('Source record numbers may contain only letters, digits, hyphens and underscores.', 422);
     const payload = { externalId, patientId: cleanText(value.patientId, 'Patient number', 80),
-        patientName: cleanText(value.patientName, 'Patient name', 120),
+        patientName: cleanPersonName(value.patientName, 'Patient name', 120),
         patientDob: value.patientDob ? dateOnly(value.patientDob, 'Birth date') : '',
         visitId: cleanText(value.visitId, 'Visit number', 80) };
     if (source === 'laboratory') {
@@ -479,7 +491,7 @@ export async function staffService(context: ServiceContext) {
     
     if (!id) {
         const username = cleanText(input.username, 'Username', 40).toLowerCase();
-        const name = cleanText(input.name, 'Staff name', 120);
+        const name = cleanPersonName(input.name, 'Staff name', 120);
         if (!/^[a-z0-9._-]{3,40}$/.test(username))
             throw new AppError('Use 3–40 letters, digits, dots, underscores or hyphens for the username.', 422);
         if (!ROLES.includes(input.role))

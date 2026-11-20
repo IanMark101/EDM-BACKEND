@@ -25,6 +25,10 @@ export const VITAL_FIELDS = [
   ['pulse', 'Pulse', 'beats/min'], ['temperature', 'Temperature', '°C'], ['respiratoryRate', 'Breathing rate', 'breaths/min'],
   ['oxygen', 'Oxygen saturation', '%'], ['weight', 'Weight', 'kg'], ['height', 'Height', 'cm'],
 ] as const;
+export const VITAL_BOUNDS: Record<typeof VITAL_FIELDS[number][0], [number, number]> = {
+  systolic: [40, 300], diastolic: [20, 200], pulse: [20, 300], temperature: [25, 45],
+  respiratoryRate: [4, 100], oxygen: [30, 100], weight: [0.5, 500], height: [20, 280],
+};
 export function cleanClinical(value: any, complete = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new AppError('Enter valid consultation sections.', 422);
   const clinical: any = { structured: true };
@@ -36,12 +40,20 @@ export function cleanClinical(value: any, complete = false) {
   clinical.allergyStatus = value.allergyStatus;
   if (value.allergyStatus === 'recorded' && !clinical.allergies) throw new AppError('Enter the reported allergy and reaction details.', 422);
   clinical.vitals = {};
-  for (const [key, label] of VITAL_FIELDS) {
+  for (const [key, label, unit] of VITAL_FIELDS) {
     const text = String(value.vitals?.[key] ?? '').trim();
-    // Validate notation only, never silently discard or label clinical measurements as normal.
+    // Validate notation and physical plausibility only, never silently discard or label clinical measurements as normal.
     if (text && (!/^\d+(\.\d{1,2})?$/.test(text) || text.length > 10)) throw new AppError(`Enter ${label.toLowerCase()} as a number, or leave it blank.`, 422);
+    if (text) {
+      const numeric = Number(text);
+      const [min, max] = VITAL_BOUNDS[key];
+      if (!Number.isFinite(numeric) || numeric < min || numeric > max)
+        throw new AppError(`${label} must be between ${min} and ${max} ${unit}. Check for a typing error.`, 422);
+    }
     clinical.vitals[key] = text;
   }
+  if (clinical.vitals.systolic && clinical.vitals.diastolic && Number(clinical.vitals.systolic) <= Number(clinical.vitals.diastolic))
+    throw new AppError('Blood pressure upper number must be greater than the lower number.', 422);
   return clinical;
 }
 export function cleanMeasurements(value: unknown): Measurement[] {

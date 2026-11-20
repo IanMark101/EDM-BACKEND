@@ -10,7 +10,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 // and startup seeding. Tests cannot connect to or seed an installed clinic.
 const bundle = await build({
   stdin: { contents: `
-    export { importsService, reviewsService, invoicesService, labsService, checkInsService } from './backend/src/services/clinic.service.ts';
+    export { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService } from './backend/src/services/clinic.service.ts';
+    export { validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName } from './shared/domain.ts';
+    export { cleanClinical } from './shared/clinical.ts';
     export { refreshWarehouse, visibleData } from './backend/src/services/server.ts';
     export { servicePricesService } from './backend/src/services/pricing.service.ts';
     export { historyService } from './backend/src/services/history.service.ts';
@@ -39,7 +41,7 @@ const bundle = await build({
     build.onLoad({ filter: /.*/, namespace: 'source' }, args => ({ contents: readFileSync(args.path, 'utf8'), loader: extname(args.path) === '.ts' ? 'ts' : 'js' }));
   } }],
 });
-const { importsService, reviewsService, invoicesService, labsService, checkInsService, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
+const { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService, validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanClinical, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
 const modelNames = ['staffAccount', 'staffSession', 'patient', 'visit', 'labReport', 'invoice', 'qualityReview', 'sourceImport', 'warehouseFact', 'warehouseRun', 'activityHistory', 'appSetting', 'visitWorkflow', 'staffNotification', 'patientPortalAccount', 'patientPortalSession'];
 function matches(row, where = {}) {
@@ -853,4 +855,62 @@ test('portal shows only the session patient and current released result, even wi
   assert.equal((await (await api('patient-portal', undefined, cookie)).json()).labs.length, 0);
   assert.equal((await api('patient-portal/logout', {}, cookie)).status, 200);
   assert.equal((await api('patient-portal', undefined, cookie)).status, 401);
+});
+
+test('contact numbers reject arbitrary digit runs and standardize valid Philippine mobile numbers', async () => {
+  assert.equal(sanitizePhoneInput('874651616516565161651651651'), '87465161651');
+  assert.equal(sanitizePhoneInput('+63 917-123-4567899'), '+63 917-123-4567');
+  for (const badPhone of ['874651616516565161651651651', '87465161651', '12345', '-----', '((()))', '08171234567', '+638171234567', '0917123456', '091712345678']) {
+    assert.throws(() => cleanPhone(badPhone), /11-digit Philippine mobile number/);
+    assert.throws(() => validatePatient({ name: 'Ana Reyes', dob: '2002-05-15', phone: badPhone }), /11-digit Philippine mobile number/);
+  }
+  assert.equal(cleanPhone(''), '');
+  assert.equal(cleanPhone('0917 123 4567'), '09171234567');
+  assert.equal(cleanPhone('0917-123-4567'), '09171234567');
+  assert.equal(cleanPhone('+63 917 123 4567'), '09171234567');
+  assert.equal(cleanPhone('+639171234567'), '09171234567');
+});
+
+test('person names collapse repeated spaces and reject numeric or symbol-only entries', () => {
+  assert.equal(cleanPersonName('  Ana   R.   Reyes  '), 'Ana R. Reyes');
+  for (const badName of ['87465161651', '12345', '???', '---', 'A', 'John 123']) {
+    assert.throws(() => cleanPersonName(badName), /valid patient name/);
+  }
+});
+
+test('clinical vital signs reject physiologically impossible typos while keeping emergency measurements', () => {
+  const valid = cleanClinical({ allergyStatus: 'none', assessment: 'Stable', plan: 'Monitor', vitals: { systolic: '185', diastolic: '110', pulse: '112', temperature: '39.8', respiratoryRate: '24', oxygen: '94', weight: '64.5', height: '165' } }, true);
+  assert.equal(valid.vitals.temperature, '39.8');
+  for (const badVitals of [
+    { temperature: '365' },
+    { temperature: '0' },
+    { oxygen: '500' },
+    { oxygen: '101' },
+    { systolic: '999', diastolic: '80' },
+    { systolic: '90', diastolic: '120' },
+    { weight: '0' },
+  ]) {
+    assert.throws(() => cleanClinical({ allergyStatus: 'none', vitals: badVitals }, false), error => error.status === 422);
+  }
+});
+
+test('cross-record date and timestamp checks reject chronologically impossible entries', async () => {
+  const doctor = { id: 'D-1', name: 'Assigned Doctor', role: 'doctor', active: true };
+  db.tables.staffAccount.push(doctor);
+  const registration = { id: 'U-REG', name: 'Registration Staff', role: 'registration', active: true };
+  await assert.rejects(checkInsService({ user: registration, id: '', input: { patientId: 'P-1', date: '1999-12-31' } }), /birth date/);
+  await assert.rejects(visitsService({ user: doctor, id: '', input: { patientId: 'P-1', date: '1999-12-31', reason: 'Check-up' } }), /birth date/);
+  await assert.rejects(prepareBill({ date: '2026-01-01' }), /earlier than the visit date/);
+
+  const labId = (await labsService({ user: doctor, input: { patientId: 'P-1', visitId: 'V-1', testName: 'Blood glucose' } })).body.id;
+  const labUser = { id: 'U-LAB', name: 'Laboratory', role: 'laboratory', active: true };
+  await assert.rejects(labsService({
+    user: labUser, id: labId,
+    input: { action: 'approve', version: 1, value: '92', unit: 'mg/dL', collectedAt: '2026-01-02T04:00:00Z', urgency: 'urgent', contact: { person: 'Dr. Buenaflor', method: 'Phone', at: '2026-01-02T03:00:00Z' }, reviewed: true },
+  }), /earlier than the sample collection time/);
+
+  const doctorCookie = await staffCookie(doctor);
+  db.tables.labReport.push({ id: 'L-DATE-ORDER', patientId: 'P-1', visitId: 'V-1', version: 1, status: 'approved', approvedAt: '2026-01-05T03:00:00Z', doctorReview: {} });
+  const badReview = await api('labs/L-DATE-ORDER/doctor-review', { version: 1, confirmed: true, plan: 'Follow up.', followUpDate: '2026-01-04' }, doctorCookie);
+  assert.equal(badReview.status, 422);
 });

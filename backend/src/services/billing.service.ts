@@ -70,9 +70,11 @@ export async function managedInvoicesService({ user, id, action, input }: Servic
         if (!saved.meta.changes) throw new AppError('Another staff member updated this bill. Refresh before saving.', 409);
         await store.insert('activityHistory', auditRow(user, 'Added bill charges', 'invoice', old.id, `Manager-priced completed services added. Reason: ${reason}`, patient.id));
       } else {
+        const billDate = dateOnly(input.date, 'Bill date');
+        if (visit.date && billDate < visit.date) throw new AppError('Bill date cannot be earlier than the visit date.', 422);
         const notices = await notificationRows(user, { key: `bill:${invoiceId}`, roles: ['billing'], kind: 'created', body: 'prepared a bill for', subject: patient.name, patientId: patient.id, entityId: invoiceId, href: `/clinic/billing?open=${invoiceId}` }, store);
         await store.batch([
-          store.insert('invoices', { id: invoiceId, patientId: patient.id, visitId: visit.id, date: dateOnly(input.date, 'Bill date'), items, total, paid: 0, payments: [], sourceRef: newId('BILL'), version: 1, updatedAt: now() }),
+          store.insert('invoices', { id: invoiceId, patientId: patient.id, visitId: visit.id, date: billDate, items, total, paid: 0, payments: [], sourceRef: newId('BILL'), version: 1, updatedAt: now() }),
           store.insert('activityHistory', auditRow(user, 'Created bill', 'invoice', invoiceId, 'Completed services priced from the account manager’s approved list. Service and price references retained on each charge.', patient.id)), ...notificationInsert(notices),
         ]);
       }

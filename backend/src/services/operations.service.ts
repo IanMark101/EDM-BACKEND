@@ -1,5 +1,5 @@
 import { repository, match, allOf, oneOf } from '../repositories/clinic.repository';
-import { AppError, assertRole, cleanText, labProblems, type Staff } from '../../../shared/domain';
+import { AppError, assertRole, cleanText, clinicDay, labProblems, type Staff } from '../../../shared/domain';
 import { hashPassword, constantEqual, randomToken, sessionCookie } from './security';
 import { audit, auditRow, loadAll, now, permittedPatient, updateWithHistory } from './server';
 import { needsDoctorReview } from '../../../shared/clinical';
@@ -86,6 +86,8 @@ export async function doctorReviewService(context: ServiceContext) {
         throw new AppError('This approved report version already has a doctor review.', 409);
     if (input.confirmed !== true)
         throw new AppError('Confirm that you reviewed the approved report.', 422);
+    if (followUpDate && (followUpDate < '1900-01-01' || old.approvedAt && followUpDate < clinicDay(new Date(old.approvedAt))))
+        throw new AppError('Return appointment date cannot be earlier than the report approval date.', 422);
     const plan = cleanText(input.plan, 'Follow-up decision and plan', 3000);
     const doctorReview = { reportApprovedAt: old.approvedAt, reviewedAt: now(), reviewedBy: user.name, reviewedById: user.id, plan, followUpDate, followUpTime };
     await updateWithHistory("labReports", old, input.version, { doctorReview }, auditRow(user, 'Reviewed approved laboratory report', 'lab', id, 'Doctor review and follow-up decision recorded for this approved version.', old.patientId));
@@ -101,6 +103,8 @@ export async function returnAppointmentService({ user, id, input }: ServiceConte
     const { patient } = await permittedPatient(user, report.patientId);
     if (patient.doctorId !== user.id)
         throw new AppError('This report is outside your patient assignment.', 403);
+    if (schedule.followUpDate && (schedule.followUpDate < '1900-01-01' || report.approvedAt && schedule.followUpDate < clinicDay(new Date(report.approvedAt))))
+        throw new AppError('Return appointment date cannot be earlier than the report approval date.', 422);
     const review = report.doctorReview as { followUpDate?: string; followUpTime?: string };
     await updateWithHistory('labReports', report, input.version, { doctorReview: { ...review, ...schedule } },
         auditRow(user, 'Updated return appointment', 'lab', id,
