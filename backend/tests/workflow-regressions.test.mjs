@@ -11,7 +11,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const bundle = await build({
   stdin: { contents: `
     export { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService } from './backend/src/services/clinic.service.ts';
-    export { validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanDescriptiveLabel, splitPersonName, composePersonName, nameTokenKey } from './shared/domain.ts';
+    export { presentationSeedService } from './backend/src/services/presentation-seed.service.ts';
+    export { validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanDescriptiveLabel, splitPersonName, composePersonName, nameTokenKey, labProblems } from './shared/domain.ts';
     export { cleanClinical, cleanLabUnit, labResultError, templateRows, suggestedLayout } from './shared/clinical.ts';
     export { refreshWarehouse, visibleData } from './backend/src/services/server.ts';
     export { servicePricesService } from './backend/src/services/pricing.service.ts';
@@ -41,7 +42,7 @@ const bundle = await build({
     build.onLoad({ filter: /.*/, namespace: 'source' }, args => ({ contents: readFileSync(args.path, 'utf8'), loader: extname(args.path) === '.ts' ? 'ts' : 'js' }));
   } }],
 });
-const { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService, validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanDescriptiveLabel, splitPersonName, composePersonName, nameTokenKey, cleanClinical, cleanLabUnit, labResultError, templateRows, suggestedLayout, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
+const { importsService, presentationSeedService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService, validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanDescriptiveLabel, splitPersonName, composePersonName, nameTokenKey, labProblems, cleanClinical, cleanLabUnit, labResultError, templateRows, suggestedLayout, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
 const modelNames = ['staffAccount', 'staffSession', 'patient', 'visit', 'labReport', 'invoice', 'qualityReview', 'sourceImport', 'warehouseFact', 'warehouseRun', 'activityHistory', 'appSetting', 'visitWorkflow', 'staffNotification', 'patientPortalAccount', 'patientPortalSession'];
 function matches(row, where = {}) {
@@ -1108,4 +1109,71 @@ test('UCUM laboratory unit, measurement result, and specimen DQM block inverted 
   assert.equal(db.tables.labReport.find(r => r.id === labId).measurements[0].unit, 'mg/dL');
 
   await assert.rejects(importsService({ user: { id: 'U-LAB-IMP', role: 'laboratory', name: 'Lab' }, input: { source: 'laboratory', records: [lab('L-BAD-UNIT', { unit: 'dL/mg' })] } }), /standard laboratory unit/);
+});
+
+test('presentation sample seed creates 35 DQM-compliant patients, populates Record checks and warehouse, and clears cleanly', async () => {
+  db.tables.staffAccount.push(
+    { id: 'D-1', username: 'dr.buenaflor', name: 'Dr. Ian Mark Buenaflor', role: 'doctor', active: true },
+    { id: 'D-2', username: 'dr.lim', name: 'Dr. Miguel Lim', role: 'doctor', active: true },
+    { id: 'U-REG', username: 'frontdesk', name: 'Rochelle Andales', role: 'registration', active: true },
+    { id: 'U-BILL', username: 'billing', name: 'Kent Jeced Alcantara', role: 'billing', active: true },
+  );
+  const manager = await staffCookie({ id: 'U-MGR-SEED', username: 'admin', name: 'Casey Reyes', role: 'manager', active: true });
+  const doctor = await staffCookie({ id: 'D-SEED-TEST', username: 'dr.check', name: 'Doctor Check', role: 'doctor', active: true });
+  const reviewer = { id: 'U-REVIEW', name: 'Reviewer', role: 'reviewer', active: true };
+
+  // Non-manager roles are forbidden from loading or inspecting presentation sample state.
+  assert.equal((await api('presentation-seed', undefined, doctor)).status, 403);
+  assert.equal((await api('presentation-seed', { action: 'seed' }, doctor)).status, 403);
+
+  const initialStatus = await (await api('presentation-seed', undefined, manager)).json();
+  assert.equal(initialStatus.seeded, false);
+
+  const seedResponse = await api('presentation-seed', { action: 'seed' }, manager);
+  assert.equal(seedResponse.status, 200);
+  const seedBody = await seedResponse.json();
+  assert.equal(seedBody.seeded, true);
+  assert.equal(seedBody.counts.patients, 35);
+  assert.equal(seedBody.counts.visits, 35);
+  assert.equal(seedBody.counts.labs, 24);
+  assert.equal(seedBody.counts.invoices, 22);
+  assert.ok(seedBody.counts.facts > 0);
+  // Pre-existing patient P-1 and visit V-1 remain intact alongside the 35 sample patients.
+  assert.equal(db.tables.patient.length, 36);
+  assert.ok(db.tables.patient.some(p => p.id === 'P-1'));
+
+  // Validate DQM compliance on seeded approved reports (all valid except intentional L-DEMO-DQ-01).
+  const seededApproved = db.tables.labReport.filter(r => r.status === 'approved');
+  const flagged = seededApproved.filter(r => labProblems(r, db.tables.visit.find(v => v.id === r.visitId)).length > 0);
+  assert.deepEqual(flagged.map(r => r.id), ['L-DEMO-DQ-01']);
+
+  const reviewerView = await visibleData(reviewer);
+  assert.equal(reviewerView.quality.identityQuestions, 2);
+  assert.equal(reviewerView.quality.invalidApproved, 1);
+  assert.ok(reviewerView.facts.length > 0);
+
+  // Calling seed a second time is idempotent and does not duplicate rows.
+  const secondSeed = await api('presentation-seed', { action: 'seed' }, manager);
+  assert.equal(secondSeed.status, 200);
+  assert.equal(db.tables.patient.length, 36);
+  assert.equal(db.tables.labReport.length, 24);
+
+  // Reviewer can resolve held import Q-DEMO-01 by linking to Camille Bautista Torres (P-DEMO-03).
+  await reviewsService({
+    id: 'Q-DEMO-01',
+    user: reviewer,
+    input: { decision: 'link', patientId: 'P-DEMO-03', visitId: 'V-DEMO-03', confirmedDob: '1994-08-19', evidence: 'Verified Camille Bautista Torres identity card at registration.' },
+  });
+  assert.ok(db.tables.labReport.some(r => r.id === 'L-IMP-EXT-LAB-2041'));
+
+  // Clearing removes all demo records including linked import L-IMP-EXT-LAB-2041 while preserving P-1.
+  const clearResponse = await api('presentation-seed', { action: 'clear' }, manager);
+  assert.equal(clearResponse.status, 200);
+  const clearBody = await clearResponse.json();
+  assert.equal(clearBody.seeded, false);
+  assert.deepEqual(db.tables.patient.map(p => p.id), ['P-1']);
+  assert.equal(db.tables.labReport.length, 0);
+  assert.equal(db.tables.qualityReview.length, 0);
+  assert.equal(db.tables.sourceImport.length, 0);
+  assert.equal(db.tables.invoice.length, 0);
 });

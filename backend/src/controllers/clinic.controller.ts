@@ -7,6 +7,7 @@ import * as operations from '../services/operations.service';
 import { servicePricesService } from '../services/pricing.service';
 import { historyService } from '../services/history.service';
 import * as portal from '../services/patient-portal.service';
+import { presentationSeedService } from '../services/presentation-seed.service';
 import { isTemporaryDatabaseError } from '../lib/database-recovery';
 import type { ServiceContext } from '../http/context';
 import type { ServiceResult } from '../http/result';
@@ -108,4 +109,5 @@ export const controllers = {
   returnAppointment: controller({ service: operations.returnAppointmentService, limit: 20_000 }),
   patientResultRelease: controller({ service: operations.patientResultReleaseService, limit: 20_000 }),
   document: controller({ service: operations.documentService, limit: 20_000 }),
+  presentationSeed: controller({ service: presentationSeedService, limit: 20_000 }),
 };

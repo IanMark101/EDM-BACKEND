@@ -35,6 +35,8 @@ export const routes: Route[] = [
   { method: 'POST', area: 'invoices', handler: controllers.invoices },
   { method: 'POST', area: 'reviews', handler: controllers.reviews },
   { method: 'POST', area: 'warehouse', id: 'refresh', handler: controllers.warehouse },
+  { method: 'GET', area: 'presentation-seed', handler: controllers.presentationSeed },
+  { method: 'POST', area: 'presentation-seed', handler: controllers.presentationSeed },
   { method: 'POST', area: 'staff', handler: controllers.staff },
 ];
 export function resolveRoute(method: string, path: string[]) {
