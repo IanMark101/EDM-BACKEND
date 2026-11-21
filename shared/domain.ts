@@ -54,6 +54,57 @@ export function cleanPhone(value: unknown, label = 'Contact number'): string {
     throw new AppError('Enter a valid 11-digit Philippine mobile number starting with 09 (or +639).', 422);
   return normalized;
 }
+const CLINIC_PHONE_ERROR = 'Enter a valid Philippine mobile (09XXXXXXXXX or +639XXXXXXXXX) or landline ((032) 496-8200 or (02) 8123-4567).';
+export function sanitizeClinicPhoneInput(value: unknown): string {
+  const raw = typeof value === 'string' ? value : '';
+  const hasPlus = raw.trimStart().startsWith('+');
+  const maxDigits = hasPlus ? 12 : 11;
+  let digits = 0;
+  let openParen = false;
+  let closedParen = false;
+  let digitsInParen = 0;
+  let out = '';
+  for (const ch of raw) {
+    if (ch === '+' && !out && hasPlus) { out += '+'; continue; }
+    if (ch === '(' && !openParen && (!out || out === '+63' || out === '+63 ')) {
+      openParen = true;
+      out += '(';
+      continue;
+    }
+    if (ch === ')' && openParen && !closedParen && digitsInParen >= 1 && digitsInParen <= 3) {
+      closedParen = true;
+      out += ')';
+      continue;
+    }
+    if (/\d/.test(ch)) {
+      if (digits >= maxDigits) continue;
+      if (openParen && !closedParen && digitsInParen >= 3) continue;
+      digits++;
+      if (openParen && !closedParen) digitsInParen++;
+      out += ch;
+    } else if ((ch === ' ' || ch === '-') && out && !(openParen && !closedParen) && !/[ (-]$/.test(out)) {
+      out += ch;
+    }
+  }
+  return out.slice(0, 20);
+}
+export function cleanClinicPhone(value: unknown, label = 'Clinic phone number'): string {
+  const raw = cleanText(value, label, 30, false);
+  if (!raw) return '';
+  if (!/^[+\d ()-]+$/.test(raw)) throw new AppError(CLINIC_PHONE_ERROR, 422);
+  const opens = (raw.match(/\(/g) || []).length;
+  const closes = (raw.match(/\)/g) || []).length;
+  if (opens !== closes || opens > 1 || (opens === 1 && !/^(?:\(0(?:2|[3-8]\d)\)|\+63[ -]?\((?:2|[3-8]\d)\))/.test(raw))) {
+    throw new AppError(CLINIC_PHONE_ERROR, 422);
+  }
+  const compact = raw.replace(/[ ()-]/g, '');
+  if (compact.indexOf('+', 1) !== -1) throw new AppError(CLINIC_PHONE_ERROR, 422);
+  const local = compact.startsWith('+63') ? `0${compact.slice(3)}` : compact;
+  if (/^09\d{9}$/.test(local)) return `${local.slice(0, 4)} ${local.slice(4, 7)} ${local.slice(7)}`;
+  if (/^02[2-9]\d{7}$/.test(local)) return `(02) ${local.slice(2, 6)}-${local.slice(6)}`;
+  if (/^0[3-8]\d[2-9]\d{6}$/.test(local)) return `(${local.slice(0, 3)}) ${local.slice(3, 6)}-${local.slice(6)}`;
+  throw new AppError(CLINIC_PHONE_ERROR, 422);
+}
 // The clinic uses a fixed UTC+8 day. Keep this independent of the
 // host's locale database so browser, Node and Worker runtimes agree.
 export function clinicDay(value: Date = new Date()): string { return new Date(value.getTime() + 8 * 60 * 60_000).toISOString().slice(0, 10); }

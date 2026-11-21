@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { AppError } from '../../../shared/domain';
+import { AppError, cleanClinicPhone } from '../../../shared/domain';
 import { hashPassword } from '../lib/crypto';
 import { match, repository } from '../repositories/clinic.repository';
 import { importIntoEmptyDatabase, snapshotOrder, type ClinicSnapshot } from '../repositories/snapshot.repository';
@@ -27,7 +27,7 @@ export async function initializeEmptyClinic(input: { name: string; username: str
     { key: 'seed-v1', value: 'individual-clinic-setup' },
     { key: 'clinic-mode', value: 'production' },
     { key: 'staff-names-20261031', value: 'individual-clinic-setup' },
-    { key: 'clinic-profile', value: JSON.stringify({ name: clinicName, address: String(input.address || '').trim(), contact: String(input.contact || '').trim() }) },
+    { key: 'clinic-profile', value: JSON.stringify({ name: clinicName, address: String(input.address || '').trim(), contact: cleanClinicPhone(input.contact, 'Clinic phone number') }) },
   ];
   await importIntoEmptyDatabase(snapshot);
 }

@@ -1020,3 +1020,32 @@ test('billing patient list excludes unbilled non-signed patients, price kinds st
   assert.equal((await api('patient-portal/logout', {}, cookie)).status, 200);
   assert.ok(db.tables.activityHistory.some(row => row.action === 'Patient signed out'));
 });
+
+test('clinic operations validates and standardizes Philippine mobile and landline clinic phone numbers', async () => {
+  const mgr = await staffCookie({ id: 'U-MGR-CLINIC', name: 'Manager', role: 'manager', active: true });
+  const base = { name: 'CareRecord Community Clinic - Cordova', address: 'Poblacion, Cordova, Cebu 6017' };
+
+  for (const [contact, expected] of [
+    ['09178245190', '0917 824 5190'],
+    ['+63 917 824 5190', '0917 824 5190'],
+    ['(032) 496-8200', '(032) 496-8200'],
+    ['032-496-8200', '(032) 496-8200'],
+    ['+63 (32) 496-8200', '(032) 496-8200'],
+    ['(02) 8123-4567', '(02) 8123-4567'],
+    ['+63 2 8123 4567', '(02) 8123-4567'],
+    ['', ''],
+  ]) {
+    const res = await api('clinic-settings', { ...base, contact }, mgr);
+    assert.equal(res.status, 200, `Expected 200 for ${JSON.stringify(contact)}`);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.profile.contact, expected);
+    const saved = JSON.parse(db.tables.appSetting.find(s => s.key === 'clinic-profile').value);
+    assert.equal(saved.contact, expected);
+  }
+
+  for (const bad of ['hello world', '0917abc4567', '87465161651', '+63 (032) 496-8200', '(032) 000-0000', '(03) 2496-8200', '(032 496-8200', '12345']) {
+    const res = await api('clinic-settings', { ...base, contact: bad }, mgr);
+    assert.equal(res.status, 422, `Expected 422 for ${JSON.stringify(bad)}`);
+  }
+});
