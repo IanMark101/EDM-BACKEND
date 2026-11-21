@@ -19,10 +19,82 @@ export function cleanText(value: unknown, label: string, max = 200, required = t
   if (text.length > max) throw new AppError(`${label} must be ${max} characters or fewer.`, 422);
   return text;
 }
+export const NAME_SUFFIXES = ['', 'Jr.', 'Sr.', 'II', 'III', 'IV', 'V'] as const;
+export const STAFF_TITLES = ['', 'Dr.'] as const;
+export function cleanDescriptiveLabel(value: unknown, label: string, max = 120, required = true): string {
+  const text = cleanText(value, label, max, required);
+  if (text && !/\p{L}.*\p{L}/u.test(text))
+    throw new AppError(`Enter a valid ${label.toLowerCase()} containing letters.`, 422);
+  return text;
+}
+export function sanitizeNamePartInput(value: unknown, max = 50): string {
+  return String(value ?? '')
+    .replace(/[^\p{L}\p{M} .'’-]/gu, '')
+    .replace(/^\s+/, '')
+    .replace(/[ \t]+/g, ' ')
+    .slice(0, max);
+}
+export function sanitizeDecimalInput(value: unknown, maxDecimals = 2, maxWholeDigits = 7): string {
+  const raw = String(value ?? '').replace(/[^\d.]/g, '');
+  const dot = raw.indexOf('.');
+  if (dot === -1) return raw.slice(0, maxWholeDigits);
+  const whole = raw.slice(0, dot).slice(0, maxWholeDigits);
+  const fraction = raw.slice(dot + 1).replace(/\./g, '').slice(0, maxDecimals);
+  return `${whole}.${fraction}`;
+}
+export function sanitizeUsernameInput(value: unknown): string {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 40);
+}
+const TWO_WORD_SURNAME_PREFIXES = new Set(['de la', 'de los', 'de las']);
+const ONE_WORD_SURNAME_PREFIXES = new Set(['del', 'dela', 'de', 'san', 'santa', 'santo', 'sta.', 'sto.', 'la', 'los', 'las']);
+export function splitPersonName(fullName: unknown, allowTitle = false) {
+  const clean = typeof fullName === 'string' ? fullName.trim().replace(/[ \t]+/g, ' ') : '';
+  if (!clean) return { title: '', firstName: '', middleName: '', lastName: '', suffix: '' };
+  const tokens = clean.split(' ').filter(Boolean);
+  let title = '';
+  if (allowTitle && tokens.length && /^dr\.?$/i.test(tokens[0])) {
+    title = 'Dr.';
+    tokens.shift();
+  }
+  let suffix = '';
+  if (tokens.length >= 2) {
+    const tailKey = tokens[tokens.length - 1].toLocaleLowerCase().replace(/\.$/, '');
+    const matched = NAME_SUFFIXES.find(s => s && s.toLocaleLowerCase().replace(/\.$/, '') === tailKey);
+    if (matched) {
+      suffix = matched;
+      tokens.pop();
+    }
+  }
+  if (!tokens.length) return { title, firstName: '', middleName: '', lastName: '', suffix };
+  if (tokens.length === 1) return { title, firstName: tokens[0], middleName: '', lastName: '', suffix };
+  if (tokens.length === 2) return { title, firstName: tokens[0], middleName: '', lastName: tokens[1], suffix };
+  const twoPrefix = `${tokens[tokens.length - 3]} ${tokens[tokens.length - 2]}`.toLocaleLowerCase();
+  let lastCount = 1;
+  if (tokens.length >= 4 && TWO_WORD_SURNAME_PREFIXES.has(twoPrefix)) lastCount = 3;
+  else if (ONE_WORD_SURNAME_PREFIXES.has(tokens[tokens.length - 2].toLocaleLowerCase())) lastCount = 2;
+  const lastStart = tokens.length - lastCount;
+  return {
+    title,
+    firstName: tokens[0],
+    middleName: tokens.slice(1, lastStart).join(' '),
+    lastName: tokens.slice(lastStart).join(' '),
+    suffix,
+  };
+}
+export function composePersonName(parts: { title?: string; firstName?: string; middleName?: string; lastName?: string; suffix?: string }): string {
+  const norm = (value: unknown) => typeof value === 'string' ? value.trim().replace(/[ \t]+/g, ' ') : '';
+  const title = norm(parts.title);
+  let firstName = norm(parts.firstName);
+  if (title === 'Dr.' && /^dr\.?\s+/i.test(firstName)) firstName = firstName.replace(/^dr\.?\s+/i, '');
+  return [title, firstName, norm(parts.middleName), norm(parts.lastName), norm(parts.suffix)].filter(Boolean).join(' ');
+}
 export function cleanPersonName(value: unknown, label = 'Patient name', max = 120): string {
   const name = cleanText(value, label, max);
-  if (!/^(?=.*\p{L}.*\p{L})[\p{L}\p{M} .,'’-]+$/u.test(name))
+  if (!/^(?=.*\p{L}.*\p{L})[\p{L}\p{M} .'’-]+$/u.test(name))
     throw new AppError(`Enter a valid ${label.toLowerCase()} using letters, spaces, periods, hyphens or apostrophes.`, 422);
+  const parts = name.split(' ').filter(part => /\p{L}/u.test(part));
+  if (parts.length < 2)
+    throw new AppError(`Enter a valid ${label.toLowerCase()} with both first and last name.`, 422);
   return name;
 }
 export function sanitizePhoneInput(value: unknown): string {
@@ -153,6 +225,9 @@ export function moneyCents(value: unknown, label = 'Amount'): number {
 }
 export function validatePayment(value: unknown, total: number, paid: number): number { const amount = moneyCents(value, 'Payment'); if (amount > total - paid) throw new AppError('Payment is greater than the amount still due.', 422); return amount; }
 export function identityKey(name: string) { return name.toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, ''); }
+export function nameTokenKey(name: string) {
+  return name.toLocaleLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(' ').filter(Boolean).sort().join(' ');
+}
 export function csvCell(value: unknown): string { let text = String(value ?? ''); if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`; return `"${text.replace(/"/g, '""')}"`; }
 export function publicStaff(row: any): Staff { return { id: row.id, username: row.username, name: row.name, role: row.role, active: !!row.active, mustChangePassword: !!row.mustChangePassword }; }
 export function summarizeFacts(facts: any[]) {

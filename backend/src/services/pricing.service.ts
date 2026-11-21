@@ -1,4 +1,4 @@
-import { AppError, assertRole, cleanText, moneyCents } from '../../../shared/domain';
+import { AppError, assertRole, cleanDescriptiveLabel, cleanText, moneyCents } from '../../../shared/domain';
 import { labTestCatalog, labTestKey, serviceNameKey, type ServicePrice, type ServicePriceList } from '../../../shared/billing';
 import { repository, match } from '../repositories/clinic.repository';
 import { PRICE_LIST_KEY, readPriceList } from '../repositories/pricing.repository';
@@ -32,7 +32,7 @@ export async function servicePricesService({ request, user, input }: ServiceCont
     }
     if (!['consultation', 'laboratory'].includes(input.kind)) throw new AppError('Choose consultation or laboratory.', 422);
     const kind = input.kind as ServicePrice['kind'];
-    const name = kind === 'consultation' ? 'Consultation' : cleanText(input.name, 'Service name', 120);
+    const name = kind === 'consultation' ? 'Consultation' : cleanDescriptiveLabel(input.name, 'Service name', 120);
     const amount = moneyCents(input.amount, 'Service price');
     if (typeof input.active !== 'boolean') throw new AppError('Choose whether the price is available to billing.', 422);
     const old = input.id ? previous.entries.find(entry => entry.id === input.id) : undefined;

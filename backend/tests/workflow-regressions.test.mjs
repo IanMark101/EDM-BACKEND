@@ -11,8 +11,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const bundle = await build({
   stdin: { contents: `
     export { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService } from './backend/src/services/clinic.service.ts';
-    export { validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName } from './shared/domain.ts';
-    export { cleanClinical } from './shared/clinical.ts';
+    export { validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanDescriptiveLabel, splitPersonName, composePersonName, nameTokenKey } from './shared/domain.ts';
+    export { cleanClinical, cleanLabUnit, labResultError, templateRows, suggestedLayout } from './shared/clinical.ts';
     export { refreshWarehouse, visibleData } from './backend/src/services/server.ts';
     export { servicePricesService } from './backend/src/services/pricing.service.ts';
     export { historyService } from './backend/src/services/history.service.ts';
@@ -41,7 +41,7 @@ const bundle = await build({
     build.onLoad({ filter: /.*/, namespace: 'source' }, args => ({ contents: readFileSync(args.path, 'utf8'), loader: extname(args.path) === '.ts' ? 'ts' : 'js' }));
   } }],
 });
-const { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService, validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanClinical, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
+const { importsService, reviewsService, invoicesService, labsService, checkInsService, patientsService, visitsService, staffService, validatePatient, cleanPhone, sanitizePhoneInput, cleanPersonName, cleanDescriptiveLabel, splitPersonName, composePersonName, nameTokenKey, cleanClinical, cleanLabUnit, labResultError, templateRows, suggestedLayout, servicePricesService, historyService, chargeOffers, visibleData, renderDocument, refreshWarehouse, repository, onNotificationChanges, routeRequest, prepareHostedClinic } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
 const modelNames = ['staffAccount', 'staffSession', 'patient', 'visit', 'labReport', 'invoice', 'qualityReview', 'sourceImport', 'warehouseFact', 'warehouseRun', 'activityHistory', 'appSetting', 'visitWorkflow', 'staffNotification', 'patientPortalAccount', 'patientPortalSession'];
 function matches(row, where = {}) {
@@ -873,7 +873,7 @@ test('contact numbers reject arbitrary digit runs and standardize valid Philippi
 
 test('person names collapse repeated spaces and reject numeric or symbol-only entries', () => {
   assert.equal(cleanPersonName('  Ana   R.   Reyes  '), 'Ana R. Reyes');
-  for (const badName of ['87465161651', '12345', '???', '---', 'A', 'John 123']) {
+  for (const badName of ['87465161651', '12345', '???', '---', 'A', 'John 123', 'Maria', 'Santos, Maria']) {
     assert.throws(() => cleanPersonName(badName), /valid patient name/);
   }
 });
@@ -1048,4 +1048,64 @@ test('clinic operations validates and standardizes Philippine mobile and landlin
     const res = await api('clinic-settings', { ...base, contact: bad }, mgr);
     assert.equal(res.status, 422, `Expected 422 for ${JSON.stringify(bad)}`);
   }
+});
+
+test('structured person names, reversed-order duplicate detection, and descriptive labels enforce DQM', async () => {
+  const parts = splitPersonName('Maria Clara De la Cruz Jr.');
+  assert.deepEqual(parts, { title: '', firstName: 'Maria', middleName: 'Clara', lastName: 'De la Cruz', suffix: 'Jr.' });
+  assert.equal(composePersonName(parts), 'Maria Clara De la Cruz Jr.');
+  assert.deepEqual(splitPersonName('Dr. Ian Mark Buenaflor', true), { title: 'Dr.', firstName: 'Ian', middleName: 'Mark', lastName: 'Buenaflor', suffix: '' });
+  assert.equal(composePersonName({ title: 'Dr.', firstName: 'Dr. Ian', lastName: 'Buenaflor' }), 'Dr. Ian Buenaflor');
+
+  db.tables.staffAccount.push({ id: 'D-1', name: 'Assigned Doctor', role: 'doctor', active: true });
+  const reg = await staffCookie({ id: 'U-REG-NAME', name: 'Registration', role: 'registration', active: true });
+  assert.equal((await api('patients', { name: 'Maria Clara Santos', dob: '1988-06-14', doctorId: 'D-1' }, reg)).status, 201);
+  assert.equal((await api('patients', { name: 'Santos Maria Clara', dob: '1988-06-14', doctorId: 'D-1' }, reg)).status, 409);
+
+  const mgr = await staffCookie({ id: 'U-MGR-LABEL', name: 'Manager', role: 'manager', active: true });
+  assert.equal((await api('service-prices', { kind: 'laboratory', name: '12345', amount: '250', active: true, version: 1 }, mgr)).status, 422);
+  assert.equal((await api('service-prices', { kind: 'laboratory', name: '@@@@', amount: '250', active: true, version: 1 }, mgr)).status, 422);
+  assert.equal((await api('clinic-settings', { name: '12345', address: '', contact: '' }, mgr)).status, 422);
+});
+
+test('UCUM laboratory unit, measurement result, and specimen DQM block inverted units like dL/mg', async () => {
+  for (const [raw, expected] of [['mg/dL', 'mg/dL'], ['mg/dl', 'mg/dL'], ['g / dl', 'g/dL'], ['mmol/l', 'mmol/L'], ['not applicable', 'Not applicable']]) {
+    assert.equal(cleanLabUnit(raw), expected);
+  }
+  for (const badUnit of ['dL/mg', 'dl/mg', 'mgdl', 'asdf', '123']) {
+    assert.throws(() => cleanLabUnit(badUnit), /standard laboratory unit/);
+  }
+  assert.match(labResultError('185 mg/dL', 'mg/dL'), /numeric result/);
+  assert.match(labResultError('hello', 'mg/dL'), /numeric result/);
+  for (const goodResult of ['185', '5.6', '<5', '>400', '2-4']) assert.equal(labResultError(goodResult, 'mg/dL'), '');
+  assert.equal(labResultError('Negative', 'Not applicable'), '');
+
+  for (const [testName, expectedLayout, expectedUnit] of [
+    ['Blood glucose', 'glucose', 'mg/dL'],
+    ['Complete blood count', 'cbc', 'g/dL'],
+    ['Urinalysis', 'urinalysis', 'Not applicable'],
+    ['Lipid panel', 'lipid', 'mg/dL'],
+    ['Hemoglobin A1c', 'hba1c', '%'],
+    ['Creatinine', 'creatinine', 'mg/dL'],
+    ['Blood urea nitrogen', 'bun', 'mg/dL'],
+  ]) {
+    assert.equal(suggestedLayout(testName), expectedLayout);
+    assert.equal(templateRows(expectedLayout)[0].unit, expectedUnit);
+  }
+
+  db.tables.staffAccount.push({ id: 'D-1', name: 'Assigned Doctor', role: 'doctor', active: true });
+  const doctor = await staffCookie({ id: 'D-1', name: 'Assigned Doctor', role: 'doctor', active: true });
+  const labUser = await staffCookie({ id: 'U-LAB-DQM', name: 'Lab Staff', role: 'laboratory', active: true });
+  const labId = (await (await api('labs', { patientId: 'P-1', visitId: 'V-1', testName: 'Blood glucose' }, doctor)).json()).id;
+
+  assert.equal((await api(`labs/${labId}`, { action: 'save', version: 1, layout: 'general', value: '92', unit: 'dL/mg', collectedAt: '2026-01-02T04:00:00Z' }, labUser)).status, 422);
+  assert.equal((await api(`labs/${labId}`, { action: 'save', version: 1, layout: 'general', value: '92 mg/dL', unit: 'mg/dL', collectedAt: '2026-01-02T04:00:00Z' }, labUser)).status, 422);
+  assert.equal((await api(`labs/${labId}`, { action: 'save', version: 1, layout: 'general', value: '92', unit: 'mg/dL', specimen: '12345', collectedAt: '2026-01-02T04:00:00Z' }, labUser)).status, 422);
+  assert.equal((await api(`labs/${labId}`, { action: 'save', version: 1, layout: 'glucose', measurements: [{ name: '123', result: '92', unit: 'mg/dL', reference: '', flag: '' }], collectedAt: '2026-01-02T04:00:00Z' }, labUser)).status, 422);
+  assert.equal((await api(`labs/${labId}`, { action: 'save', version: 1, layout: 'glucose', measurements: [{ name: 'Blood glucose', result: '92', unit: 'mg/dL', reference: '', flag: '' }], urgency: 'urgent', contact: { person: '12345', method: 'Phone', at: '2026-01-02T04:30:00Z' }, collectedAt: '2026-01-02T04:00:00Z' }, labUser)).status, 422);
+  assert.equal((await api(`labs/${labId}`, { action: 'save', version: 1, layout: 'glucose', measurements: [{ name: 'Blood glucose', result: '92', unit: 'mg/dL', reference: '', flag: '' }], urgency: 'urgent', contact: { person: 'Dr. Buenaflor', method: '123', at: '2026-01-02T04:30:00Z' }, collectedAt: '2026-01-02T04:00:00Z' }, labUser)).status, 422);
+  assert.equal((await api(`labs/${labId}`, { action: 'approve', version: 1, layout: 'glucose', specimen: 'Blood', measurements: [{ name: 'Blood glucose', result: '92', unit: 'mg/dl', reference: '70-99', flag: '' }], collectedAt: '2026-01-02T04:00:00Z', urgency: 'routine', reviewed: true }, labUser)).status, 200);
+  assert.equal(db.tables.labReport.find(r => r.id === labId).measurements[0].unit, 'mg/dL');
+
+  await assert.rejects(importsService({ user: { id: 'U-LAB-IMP', role: 'laboratory', name: 'Lab' }, input: { source: 'laboratory', records: [lab('L-BAD-UNIT', { unit: 'dL/mg' })] } }), /standard laboratory unit/);
 });

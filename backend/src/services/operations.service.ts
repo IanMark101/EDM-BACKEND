@@ -1,5 +1,5 @@
 import { repository, match, allOf, oneOf } from '../repositories/clinic.repository';
-import { AppError, assertRole, cleanClinicPhone, cleanText, clinicDay, labProblems, type Staff } from '../../../shared/domain';
+import { AppError, assertRole, cleanClinicPhone, cleanDescriptiveLabel, cleanText, clinicDay, labProblems, type Staff } from '../../../shared/domain';
 import { hashPassword, constantEqual, randomToken, sessionCookie } from './security';
 import { audit, auditRow, loadAll, now, permittedPatient, updateWithHistory } from './server';
 import { needsDoctorReview } from '../../../shared/clinical';
@@ -55,7 +55,7 @@ export async function clinicSettingsService(context: ServiceContext) {
     }
     if (request.method === 'POST') {
         
-        const profile = { name: cleanText(input.name, 'Clinic name', 120), address: cleanText(input.address, 'Clinic address', 300, false), contact: cleanClinicPhone(input.contact, 'Clinic phone number') };
+        const profile = { name: cleanDescriptiveLabel(input.name, 'Clinic name', 120), address: cleanText(input.address, 'Clinic address', 300, false), contact: cleanClinicPhone(input.contact, 'Clinic phone number') };
         await repository.batch([repository.insert("appSettings", { key: 'clinic-profile', value: JSON.stringify(profile) }, { conflict: "key", set: { value: JSON.stringify(profile) } }), repository.insert("activityHistory", auditRow(user, 'Updated clinic document details', 'staff', 'clinic-profile', 'Clinic name, address and phone number updated for printed documents.'))]);
         return result({ ok: true, profile });
     }

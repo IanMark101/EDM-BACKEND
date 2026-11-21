@@ -1,10 +1,10 @@
 import { repository, match, allOf, oneOf, type ClinicRepository } from '../repositories/clinic.repository';
-import { AppError, assertRole, cleanText, cleanPersonName, clinicDay, dateOnly, validatePatient, moneyCents, identityKey, labProblems, ROLES, publicStaff, csvCell, type Staff } from '../../../shared/domain';
+import { AppError, assertRole, cleanDescriptiveLabel, cleanText, cleanPersonName, clinicDay, dateOnly, validatePatient, moneyCents, identityKey, nameTokenKey, labProblems, ROLES, publicStaff, csvCell, type Staff } from '../../../shared/domain';
 import { authenticate, audit, auditRow, now, newId, visibleData, permittedPatient, loadAll, updateWithHistory, refreshWarehouse } from './server';
 import { ensureSeed } from '../repositories/seed';
 import { hashPassword, randomToken, constantEqual, digest, SESSION_MS, sessionCookie, cookieToken, requireSameOrigin } from './security';
 import { notificationRows, notificationInsert } from './notifications';
-import { cleanClinical, cleanMeasurements, LAB_LAYOUTS } from '../../../shared/clinical';
+import { cleanClinical, cleanLabUnit, cleanMeasurements, LAB_LAYOUTS, labResultError } from '../../../shared/clinical';
 import { labTestCatalog, serviceNameKey } from '../../../shared/billing';
 import { managedInvoicesService, pricedImportItems } from './billing.service';
 import { readPriceList } from '../repositories/pricing.repository';
@@ -192,8 +192,9 @@ export async function patientsService(context: ServiceContext) {
     return repository.transaction(async store => {
         const old = id ? requiredRow((await store.find("patients", match("id", id)))[0]) : undefined;
         const identity = identityKey(fields.name);
+        const tokenIdentity = nameTokenKey(fields.name);
         const sameBirthDate = await store.find("patients", match("dob", fields.dob));
-        const possible = sameBirthDate.filter(p => p.id !== id && identityKey(p.name) === identity);
+        const possible = sameBirthDate.filter(p => p.id !== id && (identityKey(p.name) === identity || nameTokenKey(p.name) === tokenIdentity));
         if (possible.length && !(input.confirmDifferentPerson === true && typeof input.reason === 'string' && input.reason.trim().length >= 12))
             throw new AppError(`Possible existing patient: ${possible.map(p => `${p.name} (${p.id})`).join(', ')}. Check the record before creating another. If this is a different person, confirm that and record the evidence.`, 409);
         const doctor = (await store.find("staffAccounts", match("id", doctorId)))[0];
@@ -382,19 +383,23 @@ export async function labsService(context: ServiceContext) {
         throw new AppError('Use a recorded correction for an approved report.', 422);
     if (mode === 'correct' && old.status !== 'approved')
         throw new AppError('Only approved reports use the correction process.', 422);
-    const fields = { value: cleanText(input.value, 'Result', 3000, false), unit: cleanText(input.unit, 'Unit', 80, false), collectedAt: cleanText(input.collectedAt, 'Collection time', 40, false) };
+    const fields = { value: cleanText(input.value, 'Result', 3000, false), unit: cleanLabUnit(input.unit, false), collectedAt: cleanText(input.collectedAt, 'Collection time', 40, false) };
     if (fields.collectedAt && !Number.isFinite(Date.parse(fields.collectedAt)))
         throw new AppError('Enter a valid collection time.', 422);
     const layout = input.layout ?? old.layout;
     if (!LAB_LAYOUTS.some(l => l.id === layout))
         throw new AppError('Choose a listed report layout.', 422);
     const measurements = input.measurements === undefined ? old.measurements : cleanMeasurements(input.measurements);
+    if (!(Array.isArray(measurements) && measurements.length) && fields.value && fields.unit) {
+        const resultErr = labResultError(fields.value, fields.unit);
+        if (resultErr) throw new AppError(resultErr, 422);
+    }
     const urgency = input.urgency ?? old.urgency;
     if (!['routine', 'urgent'].includes(urgency))
         throw new AppError('Choose routine or urgent review.', 422);
     const contact: any = urgency !== 'urgent' ? {} : input.contact === undefined ? old.contact : {
-        person: cleanText(input.contact?.person, 'Staff member contacted', 120, false),
-        method: cleanText(input.contact?.method, 'Contact method', 80, false),
+        person: String(input.contact?.person ?? '').trim() ? cleanPersonName(input.contact.person, 'Staff member contacted', 120) : '',
+        method: cleanDescriptiveLabel(input.contact?.method, 'Contact method', 80, false),
         at: cleanText(input.contact?.at, 'Contact time', 40, false),
     };
     if (contact.at && (!Number.isFinite(Date.parse(contact.at)) || Date.parse(contact.at) > Date.now() + 60000))
@@ -409,7 +414,7 @@ export async function labsService(context: ServiceContext) {
     if (mode !== 'save' && urgency === 'urgent' && (!contact.person || !contact.method || !contact.at))
         throw new AppError('For an urgent report, contact the responsible clinician and record their name, contact method and time before approval.', 422);
     const report = { ...old, ...fields, layout, measurements,
-        specimen: cleanText(input.specimen ?? old.specimen, 'Sample type', 120, false),
+        specimen: cleanDescriptiveLabel(input.specimen ?? old.specimen, 'Sample type', 120, false),
         reportComment: cleanText(input.reportComment ?? old.reportComment, 'Report comment', 2000, false), urgency, contact };
     const problems = labProblems(report, visit);
     if (mode !== 'save' && problems.length)
@@ -490,7 +495,7 @@ function cleanImportPayload(source: string, value: any) {
             throw new AppError(`Record ${externalId}: collection time must be valid ISO 8601 with Z or an explicit timezone offset.`, 422);
         if (collectedAt) dateOnly(collectedAt.slice(0, 10), 'Collection date', true);
         return { ...payload, testName: cleanText(value.testName, 'Test name', 120),
-            value: cleanText(value.value, 'Result', 3000, false), unit: cleanText(value.unit, 'Unit', 80, false),
+            value: cleanText(value.value, 'Result', 3000, false), unit: cleanLabUnit(value.unit, false),
             collectedAt: collectedAt ? new Date(collectedAt).toISOString() : '' };
     }
     // Validate amounts here; materialization converts these decimal amounts to cents.
