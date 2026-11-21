@@ -159,6 +159,8 @@ export async function documentService(context: ServiceContext) {
     const payment = kind === 'receipt' ? (record.payments as any[]).find(p => p.id === paymentId) : undefined;
     if (kind === 'receipt' && !payment)
         throw new AppError('Choose a payment recorded on this bill.', 404);
+    if (kind === 'receipt' && payment.voidedAt)
+        throw new AppError('A voided payment cannot be printed as an active receipt.', 422);
     const html = renderDocument(kind, record, patient, data.staff, profile, payment);
     await audit(user, 'Opened printable document', kind === 'visit' ? 'visit' : kind === 'lab' ? 'lab' : 'invoice', record.id, `Saved ${kind} document opened for printing.`, patient.id);
     return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, private', 'X-Content-Type-Options': 'nosniff',

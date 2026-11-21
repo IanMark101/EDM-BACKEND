@@ -37,6 +37,7 @@ export async function servicePricesService({ request, user, input }: ServiceCont
     if (typeof input.active !== 'boolean') throw new AppError('Choose whether the price is available to billing.', 422);
     const old = input.id ? previous.entries.find(entry => entry.id === input.id) : undefined;
     if (input.id && !old) throw new AppError('This service price no longer exists. Reload the list.', 404);
+    if (old && old.kind !== kind) throw new AppError('Service type cannot be changed on an existing price entry.', 422);
     if (previous.entries.some(entry => entry.id !== old?.id && entry.kind === kind && serviceNameKey(entry.name) === serviceNameKey(name))) throw new AppError('This service already has a price. Edit its existing entry.', 409);
     if (!old && previous.entries.length >= 200) throw new AppError('The price list has reached its service limit.', 422);
     const reason = old ? cleanText(input.reason, 'Reason for changing the price', 1000) : '';

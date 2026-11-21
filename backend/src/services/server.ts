@@ -61,7 +61,7 @@ export async function visibleData(user: Staff) {
     const labTestNames = user.role === 'doctor' && prices
         ? labTestCatalog(prices).filter(test => test.available).map(test => test.name)
         : undefined;
-    const patients = data.patients.filter(p => roleCanReadPatient(user, p, data.labs, data.invoices));
+    const patients = data.patients.filter(p => roleCanReadPatient(user, p, data.labs, data.invoices, data.visits));
     const ids = new Set(patients.map(p => p.id));
     const labVisitIds = new Set(data.labs.map(l => l.visitId));
     const billedVisitIds = new Set(data.invoices.map(b => b.visitId));
@@ -72,7 +72,7 @@ export async function visibleData(user: Staff) {
         date: v.date, status: v.status, checkedInAt: v.checkedInAt, billingReadyAt: v.billingReadyAt,
         ...(user.role === 'registration' ? { version: v.version } : {}) }));
     const reviewSummary = (review: any) => review?.reviewedAt ? { reportApprovedAt: review.reportApprovedAt, reviewedAt: review.reviewedAt, reviewedBy: review.reviewedBy } : {};
-    const labs = user.role === 'laboratory' ? data.labs.map(l => ({ ...l, doctorReview: reviewSummary(l.doctorReview), history: (l.history as any[]).map(h => ({ ...h, doctorReview: reviewSummary(h.doctorReview) })) })) : user.role === 'doctor' ? data.labs.filter(l => ids.has(l.patientId)).map(l => l.status === 'approved' ? l : ({ id: l.id, patientId: l.patientId, visitId: l.visitId, testName: l.testName, status: l.status, sourceRef: l.sourceRef, updatedAt: l.updatedAt })) : [];
+    const labs = user.role === 'laboratory' ? data.labs.map(l => ({ ...l, doctorReview: reviewSummary(l.doctorReview), history: (l.history as any[]).map(h => ({ ...h, doctorReview: reviewSummary(h.doctorReview) })) })) : user.role === 'doctor' ? data.labs.filter(l => ids.has(l.patientId)).map(l => l.status === 'approved' ? l : ({ id: l.id, patientId: l.patientId, visitId: l.visitId, testName: l.testName, status: l.status, sourceRef: l.sourceRef, version: l.version, updatedAt: l.updatedAt })) : [];
     const invoices = user.role === 'billing' ? data.invoices : [];
     const reviewer = user.role === 'reviewer';
     const storedReviews = data.reviews.filter(review => reviewer
@@ -129,7 +129,7 @@ export async function visibleData(user: Staff) {
 export async function permittedPatient(user: Staff, id: string) {
     const data = await loadAll();
     const patient = data.patients.find(p => p.id === id);
-    if (!patient || !roleCanReadPatient(user, patient, data.labs, data.invoices))
+    if (!patient || !roleCanReadPatient(user, patient, data.labs, data.invoices, data.visits))
         throw new AppError('This patient is not available to your account.', 403);
     return { patient, data };
 }
@@ -149,13 +149,13 @@ export async function refreshWarehouse(user: Staff) {
                 ...data.labs.filter(l => l.status === 'approved' && !labProblems(l, validVisits.get(l.visitId)).length && validPatients.has(l.patientId)).map(l => ({ id: `lab:${l.id}`, source: 'Laboratory', sourceId: l.sourceRef, kind: 'lab', patientKey: l.patientId, visitId: l.visitId, date: clinicDay(new Date(l.approvedAt || l.collectedAt)), service: l.testName, total: 0, paid: 0, refreshedAt: at })),
                 ...data.invoices.filter(b => validPatients.has(b.patientId) && validVisits.get(b.visitId)?.patientId === b.patientId).map(b => ({ id: `invoice:${b.id}`, source: 'Billing', sourceId: b.sourceRef, kind: 'invoice', patientKey: b.patientId, visitId: b.visitId, date: b.date, service: 'Clinic services', total: b.total, paid: b.paid, refreshedAt: at })),
                 ...data.invoices.filter(b => validPatients.has(b.patientId) && validVisits.get(b.visitId)?.patientId === b.patientId)
-                    .flatMap(b => (b.payments as any[]).filter(p => p.id && Number.isInteger(p.amount) && p.amount > 0 && Number.isFinite(Date.parse(p.at)))
+                    .flatMap(b => (b.payments as any[]).filter(p => !p.voidedAt && p.id && Number.isInteger(p.amount) && p.amount > 0 && Number.isFinite(Date.parse(p.at)))
                     .map(p => ({ id: `payment:${b.id}:${p.id}`, source: 'Billing', sourceId: p.id, kind: 'payment', patientKey: b.patientId,
                     visitId: b.visitId, date: clinicDay(new Date(p.at)), service: 'Payment received', total: 0, paid: p.amount, refreshedAt: at }))),
             ];
             const statements: any[] = [store.remove("warehouseFacts")];
-            for (let i = 0; i < facts.length; i += 5)
-                statements.push(store.insert("warehouseFacts", facts.slice(i, i + 5)));
+            for (let i = 0; i < facts.length; i += 100)
+                statements.push(store.insert("warehouseFacts", facts.slice(i, i + 100)));
             statements.push(store.insert("warehouseRuns", { id: runId, at, userId: user.id, count: facts.length, summary: { ...summarizeFacts(facts), formatVersion: 2 } }), store.insert("activityHistory", auditRow(user, 'Refreshed reporting copies', 'warehouse', runId, `${facts.length} checked facts copied. Unfinished consultations and incomplete or unapproved laboratory reports excluded.`)));
             await store.batch(statements as any);
             return { count: facts.length, refreshedAt: at };

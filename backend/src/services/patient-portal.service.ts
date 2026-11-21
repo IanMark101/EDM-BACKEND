@@ -109,7 +109,10 @@ export async function loginPatientPortal({ request, input }: ServiceContext) {
     if (!account?.passwordHash || account.lockedUntil && Date.parse(account.lockedUntil) > Date.now()) return null;
     if (!constantEqual(passwordHash, account.passwordHash)) {
       const failedAttempts = account.lockedUntil ? 1 : account.failedAttempts + 1;
-      await store.update('patientPortalAccounts', { failedAttempts, lockedUntil: failedAttempts >= 5 ? new Date(Date.now() + 15 * 60_000).toISOString() : null }, match('patientId', patientId));
+      const patient = await patientFor(patientId, store);
+      const writes = [store.update('patientPortalAccounts', { failedAttempts, lockedUntil: failedAttempts >= 5 ? new Date(Date.now() + 15 * 60_000).toISOString() : null }, match('patientId', patientId))];
+      if (patient) writes.push(store.insert('activityHistory', auditRow(patientActor(patient), 'Patient sign-in unsuccessful', 'patient-session', patientId, 'Credentials were not accepted. Repeated failed attempts temporarily lock the account.', patientId)));
+      await store.batch(writes as any);
       return null;
     }
     const patient = await patientFor(patientId, store);
@@ -125,7 +128,14 @@ export async function loginPatientPortal({ request, input }: ServiceContext) {
 
 export async function logoutPatientPortal({ request }: ServiceContext) {
   const token = tokenFrom(request);
-  if (validToken.test(token)) await repository.remove('patientPortalSessions', match('tokenHash', await digest(token)));
+  if (validToken.test(token)) {
+    const tokenHash = await digest(token);
+    const [session] = await repository.find('patientPortalSessions', match('tokenHash', tokenHash));
+    const patient = session ? await patientFor(session.patientId) : undefined;
+    const writes: any[] = [repository.remove('patientPortalSessions', match('tokenHash', tokenHash))];
+    if (patient) writes.push(repository.insert('activityHistory', auditRow(patientActor(patient), 'Patient signed out', 'patient-session', patient.id, 'Patient portal session ended.', patient.id)));
+    await repository.batch(writes);
+  }
   return result({ ok: true }, 200, { 'Set-Cookie': cookie(request, '') });
 }
 
@@ -160,7 +170,7 @@ export async function patientPortalRecords({ request }: ServiceContext) {
     labs: labs.sort((a, b) => b.releasedAt.localeCompare(a.releasedAt)),
     bills: bills.filter(bill => visitsById.has(bill.visitId)).map(bill => ({ id: bill.id, visitId: bill.visitId, date: bill.date, total: bill.total, paid: bill.paid,
       items: (bill.items as { description: string; amount: number }[]).map(({ description, amount }) => ({ description, amount })),
-      payments: (bill.payments as { amount: number; method: string; at: string }[]).map(({ amount, method, at }) => ({ amount, method, at })),
+      payments: (bill.payments as { amount: number; method: string; at: string; voidedAt?: string }[]).filter(p => !p.voidedAt).map(({ amount, method, at }) => ({ amount, method, at })),
     })).sort((a, b) => b.date.localeCompare(a.date)),
   });
 }

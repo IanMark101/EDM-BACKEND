@@ -28,7 +28,7 @@ export async function ensureNotificationBacklog(user: Staff, data: {
         for (const v of data.visits.filter(v => v.doctorId === user.id && ['waiting', 'draft'].includes(v.status)))
             pending.push({ entityId: v.id, patientId: v.patientId, subject: name(v.patientId), body: 'has a consultation waiting for your attention:', href: `/clinic/visits?open=${v.id}` });
     if (user.role === 'laboratory')
-        for (const l of data.labs.filter(l => l.status !== 'approved'))
+        for (const l of data.labs.filter(l => !['approved', 'cancelled'].includes(l.status)))
             pending.push({ entityId: l.id, patientId: l.patientId, subject: name(l.patientId), body: 'has a laboratory request waiting for your attention:', href: `/clinic/laboratory?open=${l.id}` });
     if (user.role === 'billing') {
         for (const v of data.visits.filter(v => v.billingReadyAt && !data.invoices.some(b => b.visitId === v.id)))

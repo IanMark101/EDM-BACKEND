@@ -83,6 +83,24 @@ export async function managedInvoicesService({ user, id, action, input }: Servic
   }
   // Payments keep the existing amounts, receipt history and optimistic version
   // check. A price-list change never recalculates a bill already saved.
+  if (action === 'void-payment') {
+    const old = (await repository.find('invoices', match('id', id)))[0];
+    if (!old) throw new AppError('This bill could not be found.', 404);
+    const paymentId = cleanText(input.paymentId, 'Payment reference', 80);
+    const reason = cleanText(input.reason, 'Reason for voiding payment', 1000);
+    if (reason.length < 12) throw new AppError('Explain why this payment is being voided in at least 12 characters.', 422);
+    const existingPayments = old.payments as any[];
+    const target = existingPayments.find(p => p.id === paymentId);
+    if (!target) throw new AppError('This payment could not be found on this bill.', 404);
+    if (target.voidedAt) throw new AppError('This payment has already been voided.', 409);
+    const updatedPayments = existingPayments.map(p => p.id === paymentId ? { ...p, voidedAt: now(), voidedBy: user.name, voidReason: reason } : p);
+    const paid = updatedPayments.filter(p => !p.voidedAt && Number.isInteger(p.amount) && p.amount > 0).reduce((sum, p) => sum + p.amount, 0);
+    const patient = (await repository.find('patients', match('id', old.patientId)))[0];
+    if (!patient) throw new AppError('This patient could not be found.', 404);
+    const notices = await notificationRows(user, { key: `payment-voided:${paymentId}`, roles: ['billing'], kind: 'edit', body: 'voided a payment on the bill for', subject: patient.name, patientId: patient.id, entityId: id, href: `/clinic/billing?open=${id}` });
+    await updateWithHistory('invoices', old, input.version, { paid, payments: updatedPayments }, auditRow(user, 'Voided payment', 'invoice', id, `Voided ${(target.amount / 100).toFixed(2)} PHP (${target.method}, ${target.id}). Reason: ${reason}`, old.patientId), notices);
+    return result({ id });
+  }
   if (action !== 'payment') throw new AppError('Choose a payment action.', 404);
   const old = (await repository.find('invoices', match('id', id)))[0];
   if (!old) throw new AppError('This bill could not be found.', 404);

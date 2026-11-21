@@ -99,8 +99,12 @@ export async function dataService(context: ServiceContext) {
 export async function reportExportService(context: ServiceContext) {
     let { request, user, id, action, input, url } = context;
     assertRole(user, ['reviewer']);
-    const from = url.searchParams.get('from') || '1900-01-01';
-    const to = url.searchParams.get('to') || '9999-12-31';
+    const rawFrom = url.searchParams.get('from');
+    const from = rawFrom ? dateOnly(rawFrom, 'From date', true) : '1900-01-01';
+    const rawTo = url.searchParams.get('to');
+    const to = rawTo ? dateOnly(rawTo, 'To date', true) : '9999-12-31';
+    if (from > to)
+        throw new AppError('The from date must be on or before the to date.', 422);
     const rows = (await repository.find("warehouseFacts", undefined)).filter(f => f.date >= from && f.date <= to);
     const csv = [['Source', 'Source record', 'Kind', 'Date', 'Service', 'Charges PHP', 'Payments received PHP', 'Current paid on bill PHP', 'Current bill balance PHP', 'Last refreshed'], ...rows.map(f => [f.source, f.sourceId, f.kind, f.date, f.service, (f.total / 100).toFixed(2), ((f.kind === 'payment' ? f.paid : 0) / 100).toFixed(2), ((f.kind === 'invoice' ? f.paid : 0) / 100).toFixed(2), ((f.kind === 'invoice' ? f.total - f.paid : 0) / 100).toFixed(2), f.refreshedAt])].map(row => row.map(csvCell).join(',')).join('\r\n');
     await audit(user, 'Exported reporting copies', 'warehouse', 'CSV', `${rows.length} selected reporting rows exported. Names, birth dates, contact details, notes and result values excluded.`);
@@ -197,6 +201,11 @@ export async function patientsService(context: ServiceContext) {
             throw new AppError('Choose an active doctor.', 422);
         if (old) {
             const reason = evidence(input.reason);
+            if (fields.dob !== old.dob) {
+                const patientVisits = await store.find("visits", match("patientId", id));
+                if (patientVisits.some(v => v.status !== 'cancelled' && v.date && v.date < fields.dob))
+                    throw new AppError('Birth date cannot be later than an existing visit recorded for this patient.', 422);
+            }
             if (old.doctorId !== doctorId) {
                 const open = await store.find("visits", allOf(match("patientId", id), openVisitStatuses));
                 const owners = open.length ? await store.find("staffAccounts", oneOf("id", [...new Set(open.map(visit => visit.doctorId))])) : [];
@@ -252,10 +261,40 @@ export async function visitsService(context: ServiceContext) {
         await updateWithHistory("visits", old, input.version, { status: 'draft' }, auditRow(user, 'Started consultation', 'visit', id, 'The responsible doctor began this consultation.', old.patientId));
         return result({ id });
     }
-    if (!['save', 'sign', 'correct'].includes(mode))
+    if (mode === 'cancel') {
+        if (old.status === 'signed')
+            throw new AppError('Signed consultations cannot be cancelled. Use a recorded correction instead.', 422);
+        if (old.status === 'cancelled')
+            throw new AppError('This consultation has already been cancelled.', 409);
+        const reason = evidence(input.reason);
+        return repository.transaction(async store => {
+            const current = requiredRow((await store.find("visits", match("id", id)))[0]);
+            if (current.doctorId !== user.id)
+                throw new AppError('Only the responsible doctor can change this consultation.', 403);
+            if (current.status === 'signed')
+                throw new AppError('Signed consultations cannot be cancelled. Use a recorded correction instead.', 422);
+            if (current.status === 'cancelled')
+                throw new AppError('This consultation has already been cancelled.', 409);
+            const labs = await store.find("labReports", match("visitId", id));
+            if (labs.some(l => l.status === 'approved'))
+                throw new AppError('This visit has an approved laboratory report and cannot be cancelled.', 409);
+            if (labs.some(l => l.status !== 'cancelled'))
+                throw new AppError('Cancel any active laboratory requests for this visit before cancelling the consultation.', 409);
+            const bills = await store.find("invoices", match("visitId", id));
+            if (bills.length)
+                throw new AppError('This visit already has a bill and cannot be cancelled.', 409);
+            const patient = requiredRow((await store.find("patients", match("id", current.patientId)))[0]);
+            const notices = await notificationRows(user, { key: `visit-cancelled:${id}`, roles: ['registration'], kind: 'edit', body: 'cancelled the open consultation for', subject: patient.name, patientId: patient.id, entityId: id, href: '/clinic/reception' }, store);
+            await updateWithHistory("visits", current, input.version, { status: 'cancelled' }, auditRow(user, 'Cancelled consultation', 'visit', id, reason, current.patientId), notices, store);
+            return result({ id });
+        }, patientSchedulingLock);
+    }
+    if (!['save', 'sign', 'correct', 'cancel'].includes(mode))
         throw new AppError('Choose a valid consultation action.', 422);
     if (old.status === 'signed' && mode !== 'correct')
         throw new AppError('Use a recorded correction for signed notes.', 422);
+    if (mode === 'correct' && old.status !== 'signed')
+        throw new AppError('Only signed consultations use the correction process.', 422);
     if (old.status === 'cancelled')
         throw new AppError('This check-in was cancelled. Open a new visit.', 422);
     const notes = cleanText(input.notes, 'Consultation notes', 5000, mode !== 'save' && input.clinical === undefined);
@@ -294,12 +333,51 @@ export async function labsService(context: ServiceContext) {
             return result({ id: labId }, 201);
         }, { lock: 20261105 });
     }
+    if ((input.action || 'save') === 'cancel') {
+        assertRole(user, ['laboratory', 'doctor']);
+        const reason = evidence(input.reason);
+        return repository.transaction(async store => {
+            const old = requiredRow((await store.find("labReports", match("id", id)))[0]);
+            const patient = requiredRow((await store.find("patients", match("id", old.patientId)))[0]);
+            if (user.role === 'doctor') {
+                if (patient.doctorId !== user.id)
+                    throw new AppError('This report is outside your patient assignment.', 403);
+                if (old.status === 'draft')
+                    throw new AppError('Laboratory staff have already started this report. Ask Laboratory to cancel it if the test is no longer needed.', 409);
+            }
+            if (old.status === 'approved')
+                throw new AppError('Approved laboratory reports cannot be cancelled. Use a recorded correction instead.', 422);
+            if (old.status === 'cancelled')
+                throw new AppError('This laboratory request has already been cancelled.', 409);
+            const notices = await notificationRows(user, {
+                key: `lab-cancelled:${id}`,
+                ...(user.role === 'doctor' ? { roles: ['laboratory'] } : { staffIds: patient.doctorId ? [patient.doctorId] : [] }),
+                kind: 'edit',
+                body: 'cancelled the laboratory request for',
+                subject: patient.name,
+                patientId: patient.id,
+                entityId: id,
+                href: `/clinic/laboratory?open=${id}`,
+            }, store);
+            await updateWithHistory("labReports", old, input.version, { status: 'cancelled' }, auditRow(user, 'Cancelled laboratory request', 'lab', id, reason, old.patientId), notices, store);
+            await store.update("qualityReviews", {
+                state: 'resolved',
+                resolvedAt: now(),
+                resolvedBy: user.name,
+                resolution: 'Laboratory request cancelled.',
+                evidence: reason,
+            }, allOf(match("recordId", id), match("kind", 'lab'), match("state", 'open')));
+            return result({ id });
+        }, { lock: 20261105 });
+    }
     assertRole(user, ['laboratory']);
     const old = requiredRow((await repository.find("labReports", match("id", id)))[0]);
     const visit = requiredRow((await repository.find("visits", match("id", old.visitId)))[0]);
     const mode = input.action || 'save';
     if (!['save', 'approve', 'correct'].includes(mode))
         throw new AppError('Choose a valid laboratory action.', 422);
+    if (old.status === 'cancelled')
+        throw new AppError('This laboratory request was cancelled.', 422);
     if (old.status === 'approved' && mode !== 'correct')
         throw new AppError('Use a recorded correction for an approved report.', 422);
     if (mode === 'correct' && old.status !== 'approved')
@@ -314,7 +392,7 @@ export async function labsService(context: ServiceContext) {
     const urgency = input.urgency ?? old.urgency;
     if (!['routine', 'urgent'].includes(urgency))
         throw new AppError('Choose routine or urgent review.', 422);
-    const contact: any = input.contact === undefined ? old.contact : {
+    const contact: any = urgency !== 'urgent' ? {} : input.contact === undefined ? old.contact : {
         person: cleanText(input.contact?.person, 'Staff member contacted', 120, false),
         method: cleanText(input.contact?.method, 'Contact method', 80, false),
         at: cleanText(input.contact?.at, 'Contact time', 40, false),

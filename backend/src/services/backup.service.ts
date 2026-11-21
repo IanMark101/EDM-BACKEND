@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { environment, root } from '../config/environment';
@@ -22,6 +22,10 @@ export async function backupPostgres() {
   const file = path.join(backupDirectory, 'postgresql-' + new Date().toISOString().replace(/[:.]/g, '-') + '.crbackup');
   await writeFile(file, encryptSnapshot(Buffer.from(JSON.stringify(snapshot)), key), { flag: 'wx', mode: 0o600 });
   await recordStatus({ createdAt: new Date().toISOString() });
+  try {
+    const files = (await readdir(backupDirectory)).filter(name => name.startsWith('postgresql-') && name.endsWith('.crbackup')).sort();
+    for (const stale of files.slice(0, Math.max(0, files.length - 24))) await unlink(path.join(backupDirectory, stale)).catch(() => {});
+  } catch {}
   return { file, counts: Object.fromEntries(Object.entries(snapshot.tables).map(([name, rows]) => [name, rows.length])) };
 }
 export async function verifyPostgresBackup(file: string, target?: string) {
@@ -39,6 +43,10 @@ export async function verifyPostgresBackup(file: string, target?: string) {
 }
 export function startAutomaticBackups() {
   if (!environment.databaseUrl || process.env.CLINIC_TEST_MODE === '1' || process.env.CLINIC_AUTOBACKUP === '0') return () => {};
+  if (process.platform !== 'win32' && !process.env.CLINIC_BACKUP_KEY) {
+    console.warn('Automatic local encrypted backups are disabled: set CLINIC_BACKUP_KEY to enable.');
+    return () => {};
+  }
   let busy = false;
   const run = async () => { if (busy) return; busy = true; try { await backupPostgres(); } catch { console.error('Automatic encrypted backup failed. Check database, storage and key access.'); } finally { busy = false; } };
   void run(); const timer = setInterval(() => void run(), 15 * 60_000); timer.unref();

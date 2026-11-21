@@ -914,3 +914,109 @@ test('cross-record date and timestamp checks reject chronologically impossible e
   const badReview = await api('labs/L-DATE-ORDER/doctor-review', { version: 1, confirmed: true, plan: 'Follow up.', followUpDate: '2026-01-04' }, doctorCookie);
   assert.equal(badReview.status, 422);
 });
+
+
+test('visit corrections require a signed visit and doctors can cancel unfinished visits after labs are closed', async () => {
+  const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
+  await staffCookie({ id: 'U-REG', name: 'Registration', role: 'registration', active: true });
+  db.tables.visit[0].status = 'draft';
+  db.tables.visit[0].signedAt = null;
+  db.tables.visit[0].version = 1;
+  db.tables.visitWorkflow.push({ visitId: 'V-1', checkedInAt: '2026-01-02T01:00:00Z', queueKey: 'P-1' });
+
+  const badCorrect = await api('visits/V-1', { action: 'correct', version: 1, visitReason: 'Check-up', clinical: { allergyStatus: 'none', assessment: 'OK', plan: 'Monitor', vitals: {} }, reason: 'Trying to skip signing step.' }, doctor);
+  assert.equal(badCorrect.status, 422);
+
+  const labId = (await (await api('labs', { patientId: 'P-1', visitId: 'V-1', testName: 'Blood glucose' }, doctor)).json()).id;
+  const blockedCancel = await api('visits/V-1', { action: 'cancel', version: 1, reason: 'Patient left before examination.' }, doctor);
+  assert.equal(blockedCancel.status, 409);
+
+  assert.equal((await api(`labs/${labId}`, { action: 'cancel', version: 1, reason: 'Test cancelled before sample collection.' }, doctor)).status, 200);
+  const cancelled = await api('visits/V-1', { action: 'cancel', version: 1, reason: 'Patient left before examination.' }, doctor);
+  assert.equal(cancelled.status, 200);
+  assert.equal(db.tables.visit[0].status, 'cancelled');
+  assert.equal(db.tables.visitWorkflow[0].queueKey, null);
+  assert.ok(db.tables.staffNotification.some(n => n.entityId === 'V-1' && n.recipientRole === 'registration'));
+
+  db.tables.visit.push({ id: 'V-SIGNED', patientId: 'P-1', doctorId: 'D-1', date: '2026-01-02', status: 'signed', version: 1 });
+  assert.equal((await api('visits/V-SIGNED', { action: 'cancel', version: 1, reason: 'Should reject signed visit cancellation.' }, doctor)).status, 422);
+});
+
+test('laboratory cancellations respect role progress and routine saves discard stale urgent contact details', async () => {
+  const doctor = await staffCookie({ id: 'D-1', name: 'Assigned doctor', role: 'doctor', active: true });
+  const labUser = await staffCookie({ id: 'U-LAB-1', name: 'Lab Staff', role: 'laboratory', active: true });
+  const l1 = (await (await api('labs', { patientId: 'P-1', visitId: 'V-1', testName: 'Blood glucose' }, doctor)).json()).id;
+  const l2 = (await (await api('labs', { patientId: 'P-1', visitId: 'V-1', testName: 'Complete blood count' }, doctor)).json()).id;
+
+  assert.equal((await api(`labs/${l1}`, { action: 'cancel', version: 1, reason: 'Ordered wrong panel for visit.' }, doctor)).status, 200);
+  assert.equal(db.tables.labReport.find(r => r.id === l1).status, 'cancelled');
+  assert.equal((await api(`labs/${l1}`, { action: 'save', version: 2, value: '90', unit: 'mg/dL' }, labUser)).status, 422);
+
+  assert.equal((await api(`labs/${l2}`, { action: 'save', version: 1, layout: 'general', value: '12', unit: 'g/dL', collectedAt: '2026-01-02T04:00:00Z', urgency: 'urgent', contact: { person: 'Dr. D', method: 'Phone', at: '2026-01-02T04:30:00Z' } }, labUser)).status, 200);
+  assert.equal((await api(`labs/${l2}`, { action: 'cancel', version: 2, reason: 'Doctor wants to cancel started work.' }, doctor)).status, 409);
+
+  const approveRoutine = await api(`labs/${l2}`, { action: 'approve', version: 2, layout: 'general', value: '12', unit: 'g/dL', collectedAt: '2026-01-02T04:00:00Z', urgency: 'routine', contact: { person: 'Stale', method: 'Phone', at: '2026-01-01T00:00:00Z' }, reviewed: true }, labUser);
+  assert.equal(approveRoutine.status, 200);
+  assert.deepEqual(db.tables.labReport.find(r => r.id === l2).contact, {});
+});
+
+test('patient DOB corrections reject dates after existing visits and report export validates date ranges', async () => {
+  const reg = await staffCookie({ id: 'U-REG', name: 'Registration', role: 'registration', active: true });
+  const reviewer = await staffCookie({ id: 'U-REV', name: 'Reviewer', role: 'reviewer', active: true });
+  const badDob = await api('patients/P-1', { name: 'Audit Patient', dob: '2026-01-03', doctorId: 'D-1', version: 1, reason: 'Correcting recorded birth date.' }, reg);
+  assert.equal(badDob.status, 422);
+
+  assert.equal((await api('reports.csv?from=2026-05-02&to=2026-05-01', undefined, reviewer)).status, 422);
+  assert.equal((await api('reports.csv?from=invalid-date', undefined, reviewer)).status, 422);
+});
+
+test('voided payments adjust bill balances, block receipts, and are excluded from analytics and portal', async () => {
+  db.tables.staffAccount.push({ id: 'D-1', name: 'Doctor', role: 'doctor', active: true });
+  const billing = await staffCookie({ id: 'U-BILL-1', name: 'Cashier', role: 'billing', active: true });
+  const frontdesk = await staffCookie({ id: 'U-FRONT-1', name: 'Front desk', role: 'registration', active: true });
+  const reviewerUser = { id: 'U-REV-1', name: 'Reviewer', role: 'reviewer', active: true };
+
+  const created = await api('invoices', { patientId: 'P-1', visitId: 'V-1', date: '2026-01-02', priceListVersion: 1, items: [{ sourceKey: 'visit:V-1' }] }, billing);
+  assert.equal(created.status, 201);
+  const { id: invoiceId } = await created.json();
+  assert.equal((await api(`invoices/${invoiceId}/payment`, { amount: '6.00', method: 'Cash', reference: '', version: 1 }, billing)).status, 200);
+  const payId = db.tables.invoice[0].payments[0].id;
+  assert.equal((await api(`documents/receipt/${invoiceId}?payment=${payId}`, undefined, billing)).status, 200);
+
+  const voidRes = await api(`invoices/${invoiceId}/void-payment`, { paymentId: payId, reason: 'Entered incorrect payment amount.', version: 2 }, billing);
+  assert.equal(voidRes.status, 200);
+  assert.equal(db.tables.invoice[0].paid, 0);
+  assert.ok(db.tables.invoice[0].payments[0].voidedAt);
+  assert.ok(db.tables.activityHistory.some(row => row.action === 'Voided payment'));
+  assert.equal((await api(`invoices/${invoiceId}/void-payment`, { paymentId: payId, reason: 'Duplicate void attempt.', version: 3 }, billing)).status, 409);
+  assert.equal((await api(`documents/receipt/${invoiceId}?payment=${payId}`, undefined, billing)).status, 422);
+
+  await refreshWarehouse(reviewerUser);
+  assert.equal(db.tables.warehouseFact.filter(f => f.kind === 'payment').length, 0);
+
+  const { code } = await (await api('patient-access/P-1', { action: 'issue', verified: true }, frontdesk)).json();
+  const activated = await api('patient-portal/activate', { patientId: 'P-1', code, password: 'FictionalPass123!' });
+  const cookie = activated.headers.getSetCookie()[0].split(';')[0];
+  const portal = await (await api('patient-portal', undefined, cookie)).json();
+  assert.equal(portal.bills[0].paid, 0);
+  assert.equal(portal.bills[0].payments.length, 0);
+});
+
+test('billing patient list excludes unbilled non-signed patients, price kinds stay immutable, and portal logs auth events', async () => {
+  db.tables.patient.push({ id: 'P-WAIT', name: 'Waiting Only Patient', dob: '1999-01-01', doctorId: 'D-1' });
+  db.tables.visit.push({ id: 'V-WAIT', patientId: 'P-WAIT', doctorId: 'D-1', date: '2026-01-03', status: 'waiting' });
+  const billingView = await visibleData(cashier);
+  assert.deepEqual(billingView.patients.map(p => p.id), ['P-1']);
+
+  await assert.rejects(savePrice({ id: 'PRICE-CONSULT', kind: 'laboratory', name: 'Consultation', amount: '500', active: true, reason: 'Trying to switch price kind.' }), error => error.status === 422);
+
+  const frontdesk = await staffCookie({ id: 'U-FRONT-2', name: 'Front desk', role: 'registration', active: true });
+  const { code } = await (await api('patient-access/P-1', { action: 'issue', verified: true }, frontdesk)).json();
+  await api('patient-portal/activate', { patientId: 'P-1', code, password: 'FictionalPass123!' });
+  assert.equal((await api('patient-portal/login', { patientId: 'P-1', password: 'WrongPassword123!' })).status, 401);
+  assert.ok(db.tables.activityHistory.some(row => row.action === 'Patient sign-in unsuccessful'));
+  const loginRes = await api('patient-portal/login', { patientId: 'P-1', password: 'FictionalPass123!' });
+  const cookie = loginRes.headers.getSetCookie()[0].split(';')[0];
+  assert.equal((await api('patient-portal/logout', {}, cookie)).status, 200);
+  assert.ok(db.tables.activityHistory.some(row => row.action === 'Patient signed out'));
+});
